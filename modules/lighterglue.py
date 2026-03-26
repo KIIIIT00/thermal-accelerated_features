@@ -29,13 +29,22 @@ class LighterGlue(nn.Module):
     def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../weights/xfeat-lighterglue.pt'):
         super().__init__()
         LightGlue.default_conf = self.default_conf_xfeat
-        self.net = LightGlue(None)
+        self.net = LightGlue('xfeat')
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        # if os.path.exists(weights):
+        #     state_dict = torch.load(weights, map_location=self.dev)
+        # else:
+        #     state_dict = torch.hub.load_state_dict_from_url("https://github.com/verlab/accelerated_features/raw/main/weights/xfeat-lighterglue.pt")
         if os.path.exists(weights):
-            state_dict = torch.load(weights, map_location=self.dev)
+            # PyTorch 2.4+ のセキュリティ仕様に合わせて weights_only=True を追加
+            state_dict = torch.load(weights, map_location=self.dev, weights_only=True)
         else:
-            state_dict = torch.hub.load_state_dict_from_url("https://github.com/verlab/accelerated_features/raw/main/weights/xfeat-lighterglue.pt")
+            # torch.hub.load_state_dict_from_url の場合も念のため追加を推奨
+            state_dict = torch.hub.load_state_dict_from_url(
+                "https://github.com/verlab/accelerated_features/raw/main/weights/xfeat-lighterglue.pt", 
+                weights_only=True
+            )
 
         # rename old state dict entries
         for i in range(self.net.conf.n_layers):

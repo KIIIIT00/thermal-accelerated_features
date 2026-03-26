@@ -28,13 +28,17 @@ class XFeat(nn.Module):
 		self.detection_threshold = detection_threshold
 
 		if weights is not None:
+			# if isinstance(weights, str):
+			# 	print('loading weights from: ' + weights)
+			# 	self.net.load_state_dict(torch.load(weights, map_location=self.dev))
 			if isinstance(weights, str):
 				print('loading weights from: ' + weights)
-				self.net.load_state_dict(torch.load(weights, map_location=self.dev))
+				self.net.load_state_dict(torch.load(weights, map_location=self.dev, weights_only=True))
 			else:
 				self.net.load_state_dict(weights)
 
 		self.interpolator = InterpolateSparse2d('bicubic')
+  		self.net = torch.compile(self.net)
 
 		#Try to import LightGlue from Kornia
 		self.kornia_available = False

@@ -2,20 +2,22 @@
 train_post_kd.py
 Post-KD 訓練エントリーポイント。
 
-引数の優先順位（高い順）:
-    1. CLI 引数
-    2. --config YAML (configs/post_kd_config.yaml)
-    3. argparse デフォルト値
+kd_weights の解決優先順位:
+    1. CLI --kd_weights
+    2. post_kd_config.yaml の kd_weights（null でなければ）
+    3. post_kd_config.yaml の kd_train_config → train_config.yaml の
+       ckpt_save_path + "/thermal_kd_student_final.pth"
 
 起動例:
-    # 全ステージを順番に実行（推奨）
+    # 推奨: config だけ指定（kd_weights は自動解決）
     python train_post_kd.py --config configs/post_kd_config.yaml
 
-    # Stage 1 のみ実行
+    # Stage 1 のみ
     python train_post_kd.py --config configs/post_kd_config.yaml --stages 1
 
-    # Stage 1 → Stage 2 を連続実行
-    python train_post_kd.py --config configs/post_kd_config.yaml --stages 1 2
+    # kd_weights を直接上書き
+    python train_post_kd.py --config configs/post_kd_config.yaml \
+        --kd_weights checkpoints/thermal_kd/run_A/thermal_kd_student_final.pth
 
     # シェルスクリプト経由（推奨）
     bash scripts/train_post_kd.sh
@@ -26,11 +28,11 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Any
+from typing import Any, Optional
 
 
 # ---------------------------------------------------------------------------
-# YAML ロードヘルパー（train_kd.py と同じ実装）
+# YAML ロードヘルパー
 # ---------------------------------------------------------------------------
 
 def _load_yaml(path: str) -> dict:
@@ -48,6 +50,43 @@ def _yaml_to_defaults(cfg: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# kd_weights 自動解決
+# ---------------------------------------------------------------------------
+
+def _resolve_kd_weights(args: argparse.Namespace) -> Optional[str]:
+    """
+    kd_weights を以下の優先順位で解決して返す。
+
+    1. args.kd_weights が非 None・非空文字列
+    2. args.kd_train_config が指定されている場合:
+       → その YAML の ckpt_save_path + "/thermal_kd_student_final.pth"
+    3. None（警告を出してランダム重みで続行）
+    """
+    # 優先度1: 直接指定
+    kw = getattr(args, 'kd_weights', None)
+    if kw and str(kw).strip():
+        return str(kw).strip()
+
+    # 優先度2: kd_train_config から導出
+    kd_cfg_path = getattr(args, 'kd_train_config', None)
+    if kd_cfg_path and os.path.isfile(str(kd_cfg_path)):
+        kd_cfg = _load_yaml(str(kd_cfg_path))
+        ckpt_save_path = kd_cfg.get('ckpt_save_path', '')
+        if ckpt_save_path:
+            derived = os.path.join(
+                str(ckpt_save_path), 'thermal_kd_student_final.pth')
+            print(f"[Config] kd_weights auto-resolved from kd_train_config:")
+            print(f"         {kd_cfg_path} → ckpt_save_path={ckpt_save_path}")
+            print(f"         → kd_weights={derived}")
+            return derived
+        else:
+            print(f"[Config] WARNING: kd_train_config={kd_cfg_path} に "
+                  f"ckpt_save_path が見つかりません。")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 引数パーサー
 # ---------------------------------------------------------------------------
 
@@ -57,56 +96,60 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument('--config', type=str, default=None, metavar='PATH')
+    parser.add_argument('--config', type=str, default=None, metavar='PATH',
+                        help='post_kd_config.yaml のパス')
 
-    # ── 実行するステージ ──────────────────────────────────────────────
+    # ── KD 参照 ────────────────────────────────────────────────────────────
+    parser.add_argument(
+        '--kd_train_config', type=str, default=None,
+        help='KD フェーズの設定ファイル（train_config.yaml）。'
+             'kd_weights を自動導出するために使う。')
+    parser.add_argument(
+        '--kd_weights', type=str, default=None,
+        help='KD 済み生徒モデルの重みファイルパス。'
+             '未指定の場合は kd_train_config から自動導出。')
+
+    # ── 実行するステージ ──────────────────────────────────────────────────
     parser.add_argument(
         '--stages', nargs='+', type=int, default=[1, 2],
         help='実行するステージ番号。例: --stages 1 2')
 
-    # ── モデル ──────────────────────────────────────────────────────────
-    parser.add_argument('--kd_weights', type=str, default=None,
-                        help='KD 済み生徒モデルの重みファイルパス（必須）')
+    # ── 保存先 ────────────────────────────────────────────────────────────
     parser.add_argument('--ckpt_save_path', type=str, default=None)
 
-    # ── データセット ─────────────────────────────────────────────────────
-    # Stage 1 用（HomographicAdapter）
+    # ── データセット ──────────────────────────────────────────────────────
     parser.add_argument('--s1_dataset', nargs='+',
                         default=['freiburg', 'tartanrgbt'])
-    parser.add_argument('--s1_n_per_image', type=int, default=2,
-                        help='1枚の熱画像から生成するホモグラフィーペア数')
+    parser.add_argument('--s1_n_per_image',       type=int,   default=2)
     parser.add_argument('--s1_perspective_range', type=float, default=0.05)
     parser.add_argument('--s1_rotation_range',    type=float, default=15.0)
-    parser.add_argument('--s1_scale_range',       type=float, default=0.15)
+    parser.add_argument('--s1_scale_range',        type=float, default=0.15)
     parser.add_argument('--s1_translation_range', type=float, default=0.10)
 
-    # Stage 2 用（SequentialDataset）
     parser.add_argument('--s2_dataset', nargs='+',
                         default=['tartanrgbt', 'freiburg'])
-    parser.add_argument('--s2_stride', type=int, default=1,
-                        help='連続フレームの間隔')
+    parser.add_argument('--s2_stride', type=int, default=1)
 
-    # 共通データパス（train_config.yaml の data_roots と同じキー）
-    parser.add_argument('--data_roots', type=dict, default=None)
-    parser.add_argument('--freiburg_root',   type=str, default=None)
-    parser.add_argument('--tartanrgbt_root', type=str, default=None)
-    parser.add_argument('--vivid_root',      type=str, default=None)
-    parser.add_argument('--sthereo_root',    type=str, default=None)
-    parser.add_argument('--freiburg_splits_dir',   type=str, default=None)
+    parser.add_argument('--data_roots',          type=dict, default=None)
+    parser.add_argument('--freiburg_root',       type=str,  default=None)
+    parser.add_argument('--tartanrgbt_root',     type=str,  default=None)
+    parser.add_argument('--vivid_root',          type=str,  default=None)
+    parser.add_argument('--sthereo_root',        type=str,  default=None)
+    parser.add_argument('--freiburg_splits_dir', type=str,  default=None)
     parser.add_argument('--tartanrgbt_splits_dir', type=str, default=None)
 
     parser.add_argument('--batch_size',        type=int, default=4)
     parser.add_argument('--train_num_workers', type=int, default=4)
     parser.add_argument('--seed',              type=int, default=42)
 
-    # ── Stage 1 ハイパーパラメータ ─────────────────────────────────────
-    parser.add_argument('--s1_lr',           type=float, default=1e-4)
-    parser.add_argument('--s1_lr_step',      type=int,   default=10_000)
-    parser.add_argument('--s1_n_steps',      type=int,   default=30_000)
-    parser.add_argument('--s1_lambda_fine',  type=float, default=0.5)
-    parser.add_argument('--s1_n_pts',        type=int,   default=256)
+    # ── Stage 1 ──────────────────────────────────────────────────────────
+    parser.add_argument('--s1_lr',          type=float, default=1e-4)
+    parser.add_argument('--s1_lr_step',     type=int,   default=10_000)
+    parser.add_argument('--s1_n_steps',     type=int,   default=30_000)
+    parser.add_argument('--s1_lambda_fine', type=float, default=0.5)
+    parser.add_argument('--s1_n_pts',       type=int,   default=256)
 
-    # ── Stage 2 ハイパーパラメータ ─────────────────────────────────────
+    # ── Stage 2 ──────────────────────────────────────────────────────────
     parser.add_argument('--s2a_lr',           type=float, default=5e-5)
     parser.add_argument('--s2a_n_steps',      type=int,   default=10_000)
     parser.add_argument('--s2b_lr',           type=float, default=1e-5)
@@ -114,12 +157,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--s2_lambda_epi',    type=float, default=0.5)
     parser.add_argument('--s2_epi_threshold', type=float, default=2.0)
 
-    # ── 共通訓練設定 ────────────────────────────────────────────────────
-    parser.add_argument('--grad_clip',        type=float, default=1.0)
-    parser.add_argument('--lr_gamma',         type=float, default=0.5)
-    parser.add_argument('--save_ckpt_every',  type=int,   default=2_000)
-    parser.add_argument('--log_every',        type=int,   default=100)
-    parser.add_argument('--device_num',       type=str,   default='0')
+    # ── 共通 ─────────────────────────────────────────────────────────────
+    parser.add_argument('--grad_clip',       type=float, default=1.0)
+    parser.add_argument('--lr_gamma',        type=float, default=0.5)
+    parser.add_argument('--save_ckpt_every', type=int,   default=2_000)
+    parser.add_argument('--log_every',       type=int,   default=100)
+    parser.add_argument('--device_num',      type=str,   default='0')
 
     # ── wandb ─────────────────────────────────────────────────────────────
     parser.add_argument('--no_wandb',       action='store_true', default=False)
@@ -135,6 +178,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = _build_parser()
     pre, _ = parser.parse_known_args()
 
+    # YAML をデフォルト値として注入
     if pre.config is not None:
         if not os.path.isfile(pre.config):
             parser.error(f"--config not found: {pre.config!r}")
@@ -144,10 +188,19 @@ def parse_arguments() -> argparse.Namespace:
 
     args = parser.parse_args()
 
+    # ── kd_weights 自動解決 ───────────────────────────────────────────────
+    resolved = _resolve_kd_weights(args)
+    args.kd_weights = resolved
+    if resolved is None:
+        print("[WARNING] kd_weights を解決できませんでした。"
+              "ランダム重みで Post-KD を開始します。")
+    elif not os.path.isfile(resolved):
+        print(f"[WARNING] kd_weights が見つかりません: {resolved}")
+        print("  KD フェーズ（bash scripts/train.sh）を先に完了させてください。")
+
+    # ── その他のバリデーション ────────────────────────────────────────────
     if args.ckpt_save_path is None:
         parser.error("--ckpt_save_path is required (via --config or CLI).")
-    if args.kd_weights is None:
-        print("[WARNING] --kd_weights not specified. Model starts from random weights.")
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.device_num)
 
@@ -158,11 +211,10 @@ def parse_arguments() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# DataLoader 構築ヘルパー
+# DataLoader 構築
 # ---------------------------------------------------------------------------
 
 def _get_data_root(name: str, args: Any) -> str:
-    """data_roots dict → 個別引数 → 環境変数の順でルートパスを取得。"""
     root = (getattr(args, 'data_roots', None) or {}).get(name, '')
     if not root:
         root = getattr(args, f'{name}_root', '') or ''
@@ -172,38 +224,31 @@ def _get_data_root(name: str, args: Any) -> str:
     if not root:
         raise RuntimeError(
             f"Root path for '{name}' not configured.\n"
-            f"  Set via YAML data_roots, --{name}_root, or env {env_key}"
-        )
+            f"  post_kd_config.yaml の data_roots.{name} に設定してください。")
     return root
 
 
 def build_stage1_loader(args: Any):
-    """Stage 1 用 HomographicAdapter DataLoader を構築する。"""
     import torch
     from torch.utils.data import ConcatDataset, DataLoader
-
     from modules.dataset.thermal.freiburg   import FreiburgDataset
     from modules.dataset.thermal.tartanrgbt import TartanRGBTDataset
     from modules.dataset.thermal.homographic_adapter import ThermalHomographicDataset
 
-    _CLS = {
-        'freiburg':   FreiburgDataset,
-        'tartanrgbt': TartanRGBTDataset,
-    }
-
+    _CLS = {'freiburg': FreiburgDataset, 'tartanrgbt': TartanRGBTDataset}
     datasets = []
+
     for name in args.s1_dataset:
         name_l = name.lower()
         if name_l not in _CLS:
             raise ValueError(f"[Stage1] Unsupported dataset: {name!r}")
-        root = _get_data_root(name_l, args)
+
+        root      = _get_data_root(name_l, args)
         splits_dir = getattr(args, f'{name_l}_splits_dir', None)
 
         base_ds = _CLS[name_l](
-            data_root=root,
-            splits_dir=splits_dir,
-            split='train',
-            augment=False,   # HomographicAdapter が拡張を担う
+            data_root=root, splits_dir=splits_dir,
+            split='train', augment=False,
         )
         wrapped = ThermalHomographicDataset(
             base_dataset=base_ds,
@@ -216,70 +261,41 @@ def build_stage1_loader(args: Any):
         datasets.append(wrapped)
         print(f"[Stage1] {name}: {len(wrapped)} pairs")
 
-    combined = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
-    g = torch.Generator()
-    g.manual_seed(args.seed)
-    return DataLoader(
-        combined,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.train_num_workers,
-        pin_memory=True,
-        drop_last=True,
-        generator=g,
-    )
+    combined = (ConcatDataset(datasets) if len(datasets) > 1 else datasets[0])
+    g = torch.Generator(); g.manual_seed(args.seed)
+    return DataLoader(combined, batch_size=args.batch_size, shuffle=True,
+                      num_workers=args.train_num_workers, pin_memory=True,
+                      drop_last=True, generator=g)
 
 
 def build_stage2_loader(args: Any):
-    """Stage 2 用 SequentialDataset DataLoader を構築する。"""
     import torch
     from torch.utils.data import ConcatDataset, DataLoader
-
     from modules.dataset.thermal.sequential import (
-        TartanRGBTSequentialDataset,
-        FreiburgSequentialDataset,
-    )
+        TartanRGBTSequentialDataset, FreiburgSequentialDataset)
 
-    _CLS = {
-        'tartanrgbt': TartanRGBTSequentialDataset,
-        'freiburg':   FreiburgSequentialDataset,
-    }
-
+    _CLS = {'tartanrgbt': TartanRGBTSequentialDataset,
+            'freiburg':   FreiburgSequentialDataset}
     datasets = []
+
     for name in args.s2_dataset:
         name_l = name.lower()
         if name_l not in _CLS:
             raise ValueError(f"[Stage2] Unsupported dataset: {name!r}")
-        root = _get_data_root(name_l, args)
-        splits_dir = getattr(args, f'{name_l}_splits_dir', None)
 
-        if name_l == 'tartanrgbt':
-            ds = TartanRGBTSequentialDataset(
-                data_root=root,
-                splits_dir=splits_dir,
-                stride=args.s2_stride,
-            )
-        else:
-            ds = FreiburgSequentialDataset(
-                data_root=root,
-                splits_dir=splits_dir,
-                stride=args.s2_stride,
-            )
+        root      = _get_data_root(name_l, args)
+        splits_dir = getattr(args, f'{name_l}_splits_dir', None)
+        kwargs    = dict(data_root=root, splits_dir=splits_dir,
+                         stride=args.s2_stride)
+        ds = _CLS[name_l](**kwargs)
         datasets.append(ds)
         print(f"[Stage2] {name}: {len(ds)} pairs")
 
-    combined = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
-    g = torch.Generator()
-    g.manual_seed(args.seed)
-    return DataLoader(
-        combined,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.train_num_workers,
-        pin_memory=True,
-        drop_last=True,
-        generator=g,
-    )
+    combined = (ConcatDataset(datasets) if len(datasets) > 1 else datasets[0])
+    g = torch.Generator(); g.manual_seed(args.seed)
+    return DataLoader(combined, batch_size=args.batch_size, shuffle=True,
+                      num_workers=args.train_num_workers, pin_memory=True,
+                      drop_last=True, generator=g)
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +307,9 @@ def main() -> None:
 
     print("=" * 60)
     print("  Thermal XFeat Post-KD Training")
-    print(f"  Stages: {args.stages}")
-    print(f"  KD weights: {args.kd_weights}")
-    print(f"  Save path: {args.ckpt_save_path}")
+    print(f"  Stages       : {args.stages}")
+    print(f"  kd_weights   : {args.kd_weights}")
+    print(f"  ckpt_save_path: {args.ckpt_save_path}")
     print("=" * 60)
 
     from modules.training.train_post_kd import PostKDTrainer

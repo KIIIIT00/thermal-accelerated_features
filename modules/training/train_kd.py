@@ -27,6 +27,9 @@ from modules.training.losses_kd import (
     kd_feature_loss,
     kd_reliability_loss,
     fpn_invariance_loss,
+    fpn_invariance_loss_fast,
+    make_fpn_noise,
+    relational_kd_loss,
 )
 
 
@@ -141,11 +144,13 @@ def _args_to_wandb_config(args: Any) -> dict:
         # Sweep で探索する変数
         'lambda_kd_rel':       getattr(args, 'lambda_kd_rel',       0.1),
         'lambda_fpn':          getattr(args, 'lambda_fpn',          0.05),
+        'lambda_relkd':        getattr(args, 'lambda_relkd',        0.5),
         'fpn_sigma_min':       getattr(args, 'fpn_sigma_min',       2.0),
         'fpn_sigma_max':       getattr(args, 'fpn_sigma_max',       8.0),
         'p_diurnal_inversion': getattr(args, 'p_diurnal_inversion', 0.3),
         'infonce_temp':        getattr(args, 'infonce_temp',         0.2),
         'n_kd_samples':        getattr(args, 'n_kd_samples',        1024),
+        'n_relkd_samples':     getattr(args, 'n_relkd_samples',     512),
         # 訓練設定
         'n_steps':             getattr(args, 'n_steps',             100_000),
         'lr':                  getattr(args, 'lr',                  3e-4),
@@ -228,9 +233,11 @@ class ThermalXFeatKDTrainer:
         self.grad_clip    = getattr(args, 'grad_clip',           1.0)
         self.lambda_rel   = getattr(args, 'lambda_kd_rel',       0.1)
         self.lambda_fpn   = getattr(args, 'lambda_fpn',          0.05)
+        self.lambda_relkd = getattr(args, 'lambda_relkd',        0.5)
         self.sigma_min    = getattr(args, 'fpn_sigma_min',       2.0)
         self.sigma_max    = getattr(args, 'fpn_sigma_max',       8.0)
         self.n_samples    = getattr(args, 'n_kd_samples',        1024)
+        self.n_relkd      = getattr(args, 'n_relkd_samples',     512)
         self.temp         = getattr(args, 'infonce_temp',         0.2)
         self.save_every   = getattr(args, 'save_ckpt_every',     2_000)
         self.log_every    = getattr(args, 'log_every',           100)
@@ -287,6 +294,12 @@ class ThermalXFeatKDTrainer:
         self.writer = SummaryWriter(log_dir=logdir)
 
         self.use_wandb = _init_wandb(args)
+
+        # ── AMP（自動混合精度）────────────────────────────────────────────
+        self.use_amp = getattr(args, 'use_amp', False) and torch.cuda.is_available()
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        if self.use_amp:
+            print("[Trainer] AMP enabled (float16 mixed precision)")
 
     # ── ロギングヘルパー ─────────────────────────────────────────────────
 
@@ -419,31 +432,63 @@ class ThermalXFeatKDTrainer:
                 feats_t, _, hmap_t = self.teacher(rgb)
                 feats_t = F.normalize(feats_t, dim=1)
 
-            # ── 生徒フォワード（勾配あり）─────────────────────────────────
-            feats_s, _, hmap_s = self.student(thr)
-            feats_s = F.normalize(feats_s, dim=1)
+            # ── FPN ノイズ画像を生成 ──────────────────────────────────────
+            # 旧実装: clean フォワード(1) + fpn_invariance_loss 内で clean(1) + noisy(1) = 3回
+            # 新実装: no_grad clean(1) + 学習 noisy(1) = 2回（約33%削減）
+            img_fpn, fpn_sigma = make_fpn_noise(
+                thr,
+                sigma_min=self.sigma_min,
+                sigma_max=self.sigma_max,
+            )
+
+            # ── 生徒フォワード（クリーン・stop_gradient）────────────────
+            amp_ctx = torch.cuda.amp.autocast() if self.use_amp else torch.no_grad()
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    feats_clean, _, hmap_s = self.student(thr)
+                    feats_clean = F.normalize(feats_clean, dim=1)
+
+            # ── 生徒フォワード（ノイズ付き・学習側）────────────────────
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                feats_s, _, _ = self.student(img_fpn)
+                feats_s = F.normalize(feats_s, dim=1)
 
             # ── 損失計算 ──────────────────────────────────────────────────
+            # L_KD: ノイズ付き特徴 vs 教師（FPN 不変性も同時に学習）
             l_kd = kd_feature_loss(
                 feats_s, feats_t,
                 n_samples=self.n_samples, temp=self.temp)
 
+            # L_KD_rel: clean 信頼性マップ vs 教師信頼性マップ
             l_rel = kd_reliability_loss(hmap_s, hmap_t.detach(), thr)
 
-            # fpn_invariance_loss 内で student が追加 1 回フォワードされる
-            l_fpn, fpn_sigma = fpn_invariance_loss(
-                self.student, thr,
-                sigma_min=self.sigma_min, sigma_max=self.sigma_max,
-                return_sigma=True)
+            # L_FPN: noisy 特徴 → clean 特徴（stop_gradient）に近づける
+            l_fpn = fpn_invariance_loss_fast(feats_s, feats_clean)
 
-            loss = l_kd + self.lambda_rel * l_rel + self.lambda_fpn * l_fpn
+            # L_relkd: intra-modal 構造転移
+            l_relkd = relational_kd_loss(
+                feats_s, feats_t,
+                n_samples=self.n_relkd)
+
+            loss = (l_kd
+                    + self.lambda_rel   * l_rel
+                    + self.lambda_fpn   * l_fpn
+                    + self.lambda_relkd * l_relkd)
 
             # ── バックワード ──────────────────────────────────────────────
             self.opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.student.parameters(), self.grad_clip)
-            self.opt.step()
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.opt)
+                torch.nn.utils.clip_grad_norm_(
+                    self.student.parameters(), self.grad_clip)
+                self.scaler.step(self.opt)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.student.parameters(), self.grad_clip)
+                self.opt.step()
             self.scheduler.step()
 
             # ── ロギング（スカラー）───────────────────────────────────────
@@ -458,8 +503,14 @@ class ThermalXFeatKDTrainer:
                     'loss/kd':         l_kd.item(),
                     'loss/kd_rel':     l_rel.item(),
                     'loss/fpn':        l_fpn.item(),
+                    # Relational KD 損失（新規追加）
+                    'loss/relkd':      l_relkd.item(),
                     # KD 損失が total に占める割合（FPN・rel の寄与確認）
                     'loss/kd_ratio':   l_kd.item() / (loss.item() + 1e-8),
+                    # Relational KD が total に占める割合
+                    # → cross-modal と intra-modal の学習バランスを確認
+                    'loss/relkd_ratio': (
+                        self.lambda_relkd * l_relkd.item() / (loss.item() + 1e-8)),
                     # ── 最適化（既存 + 拡張）────────────────────────────
                     'lr':              self.opt.param_groups[0]['lr'],
                     'grad_norm/total': gnorm,
@@ -486,6 +537,7 @@ class ThermalXFeatKDTrainer:
                     f"kd={l_kd.item():.4f}  "
                     f"rel={l_rel.item():.4f}  "
                     f"fpn={l_fpn.item():.4f}  "
+                    f"relkd={l_relkd.item():.4f}  "
                     f"lr={self.opt.param_groups[0]['lr']:.2e}  "
                     f"diurnal={diurnal_count}/{diurnal_total}"
                 )
@@ -560,6 +612,7 @@ class ThermalXFeatKDTrainer:
             'loss_total':               0.0,
             'loss_kd':                  0.0,
             'loss_kd_rel':              0.0,
+            'loss_relkd':               0.0,
             'feature/cosine_sim':       0.0,
             'feature/collapse_score':   0.0,
             'feature/active_dim_ratio': 0.0,
@@ -579,15 +632,20 @@ class ThermalXFeatKDTrainer:
             feats_s, _, hmap_s = self.student(thr)
             feats_s = F.normalize(feats_s, dim=1)
 
-            l_kd  = kd_feature_loss(
+            l_kd    = kd_feature_loss(
                 feats_s, feats_t,
                 n_samples=self.n_samples, temp=self.temp)
-            l_rel = kd_reliability_loss(hmap_s, hmap_t, thr)
-            loss  = l_kd + self.lambda_rel * l_rel
+            l_rel   = kd_reliability_loss(hmap_s, hmap_t, thr)
+            l_relkd = relational_kd_loss(feats_s, feats_t,
+                                         n_samples=self.n_relkd)
+            loss    = (l_kd
+                       + self.lambda_rel   * l_rel
+                       + self.lambda_relkd * l_relkd)
 
             totals['loss_total']  += loss.item()
             totals['loss_kd']     += l_kd.item()
             totals['loss_kd_rel'] += l_rel.item()
+            totals['loss_relkd']  += l_relkd.item()
 
             # 特徴空間品質指標（バッチごとに累積して最後に平均）
             feat_metrics = compute_feature_metrics(

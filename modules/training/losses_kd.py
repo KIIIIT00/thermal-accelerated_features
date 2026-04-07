@@ -6,9 +6,24 @@ ALIKE・alike_wrapper に一切依存しない独立実装。
 losses.py を import しないこと（alike_wrapper がトップレベル import されているため）。
 
 損失構成:
-    L_total = L_KD
-            + λ_rel × L_KD_rel
-            + λ_fpn × L_FPN
+    L_total = L_KD                     ← cross-modal alignment
+            + λ_rel    × L_KD_rel      ← 信頼性マップ転移
+            + λ_fpn    × L_FPN         ← FPN ノイズ不変性（物理考慮）
+            + λ_relkd  × L_relational  ← Relational KD（intra-modal 構造転移）
+
+【損失の役割分担】
+    L_KD:         feats_s × feats_t^T の対角を最大化
+                  → cross-modal alignment（thermal を RGB 特徴空間に引き込む）
+                  → thermal↔RGB クロスモーダルマッチングに必要
+
+    L_relational: (feats_s × feats_s^T) ≈ (feats_t × feats_t^T) を最適化
+                  → intra-modal 構造の転移（Park et al., CVPR 2019）
+                  → 「同じ点を2度見たとき同じ特徴が出る」Repeatability
+                  → 「異なる点は異なる特徴が出る」Discriminability
+                  → L_KD が直接最適化しない行列を補完する
+
+    L_FPN:        FPN ノイズ付き→なしの特徴一致
+                  → 熱画像固有の列ノイズへの不変性
 
 NOTE: fpn_invariance_loss 内では student が追加 1 回フォワードされる。
       clean 側は torch.no_grad() で包む（stop_gradient）。
@@ -236,3 +251,144 @@ def fpn_invariance_loss(
         sigma_mean = (sigma.mean() * 255.0).item()
         return loss, sigma_mean
     return loss
+
+
+# ---------------------------------------------------------------------------
+# 7.6  L_relational: Relational KD（intra-modal 構造転移）
+# ---------------------------------------------------------------------------
+
+def relational_kd_loss(
+    feats_s: Tensor,
+    feats_t: Tensor,
+    n_samples: int = 512,
+) -> Tensor:
+    """
+    Relational Knowledge Distillation 損失。
+    （Park et al., "Relational Knowledge Distillation", CVPR 2019）
+
+    【役割】
+        L_KD（cross-modal InfoNCE）は feats_s × feats_t^T の対角を最大化し、
+        「熱画像の特徴 i が RGB の特徴 i に近づく」cross-modal alignment を学習する。
+
+        しかしこれだけでは feats_s × feats_s^T の構造（点間の相対関係）が
+        feats_t × feats_t^T に等しくなる保証がない。
+        不完全な cross-modal 収束のもとでは両行列が大きく乖離し、
+        thermal-thermal マッチングの Repeatability・Discriminability が低下する。
+
+        本損失は教師の intra-modal 類似度構造（T×T^T）を
+        生徒の intra-modal 構造（S×S^T）に直接転移することで、
+        L_KD が補えない行列を補完する。
+
+    【数学的根拠】
+        最適化する量:
+            MSE( S×S^T, T×T^T )
+        S = feats_s のサブサンプリング（L2 正規化済み）
+        T = feats_t のサブサンプリング（L2 正規化済み・detach 済み）
+
+        S×S^T: 生徒の点間類似度行列（(n, n)）
+        T×T^T: 教師の点間類似度行列（(n, n)）← 目標（stop_gradient）
+
+        これを最小化すると:
+            点 i, j が教師で類似 → 生徒でも類似（同一物体・同一テクスチャ）
+            点 i, j が教師で非類似 → 生徒でも非類似（異なる位置）
+        → Repeatability: 同一点を変換前後で見たときの特徴一致性
+        → Discriminability: 異なる点の特徴の弁別性
+
+    【L_KD との関係】
+        L_KD:        feats_s × feats_t^T を最適化（cross-modal）
+        L_relational: feats_s × feats_s^T を最適化（intra-modal）
+        → 独立した情報を補完的に最適化する
+
+    【stop_gradient の方向】
+        T×T^T.detach() → 教師の構造を目標として固定
+        S×S^T          → 学習側（生徒が近づける）
+        逆方向は特徴崩壊のリスクがあるため禁止
+
+    Args:
+        feats_s:   (B, 64, H/8, W/8)  生徒特徴（L2 正規化済み）
+        feats_t:   (B, 64, H/8, W/8)  教師特徴（L2 正規化済み・detach 済み）
+        n_samples: サブサンプリング数（メモリ節約のため n×n 行列を制限）
+                   n=512 → 512×512 行列（256K 要素）
+                   n=1024 → 1024×1024 行列（1M 要素）: メモリ大
+                   推奨: 256〜512
+
+    Returns:
+        loss: scalar Tensor
+    """
+    B, C, Hf, Wf = feats_s.shape
+    HW = Hf * Wf
+    n  = min(HW, n_samples)
+
+    s_flat = feats_s.reshape(B, C, HW).permute(0, 2, 1)  # (B, HW, C)
+    t_flat = feats_t.reshape(B, C, HW).permute(0, 2, 1)
+
+    total_loss = feats_s.new_zeros(1)
+    for b in range(B):
+        idx = torch.randperm(HW, device=feats_s.device)[:n]
+
+        # L2 正規化（念のため再正規化）
+        s_b = F.normalize(s_flat[b, idx], dim=1)   # (n, C)
+        t_b = F.normalize(t_flat[b, idx], dim=1)   # (n, C)
+
+        # intra-modal 類似度行列 (n, n)
+        # S×S^T: 生徒の点間コサイン類似度
+        # T×T^T: 教師の点間コサイン類似度（目標・stop_gradient）
+        S_sim = s_b @ s_b.t()   # (n, n)
+        T_sim = t_b @ t_b.t()   # (n, n)
+
+        # 教師の intra-modal 構造を生徒に転移
+        # T_sim.detach() で stop_gradient を明示（T は既に detach 済みだが二重保護）
+        total_loss = total_loss + F.mse_loss(S_sim, T_sim.detach())
+
+    return total_loss / B
+
+
+# ---------------------------------------------------------------------------
+# 7.5b  fpn_noise_forward: FPN ノイズ画像を生成して学習側フォワードのみ行う
+#        （train_kd.py のループで feats_clean を再利用するため）
+# ---------------------------------------------------------------------------
+
+def make_fpn_noise(
+    img_thr: Tensor,
+    sigma_min: float = 2.0,
+    sigma_max: float = 8.0,
+) -> Tuple[Tensor, float]:
+    """
+    FPN 列ノイズを生成してノイズ付き画像を返す。
+
+    Returns:
+        img_fpn  : (B, 3, H, W) ノイズ付き熱画像
+        sigma_mean: float 平均ノイズ強度 (DN単位)
+    """
+    B, C, H, W = img_thr.shape
+    sigma = (
+        torch.rand(B, 1, device=img_thr.device)
+        * (sigma_max - sigma_min) / 255.0
+        + sigma_min / 255.0
+    )
+    col_noise = torch.randn(B, 1, 1, W, device=img_thr.device)         * sigma.view(B, 1, 1, 1)
+    col_noise = col_noise.expand(B, C, H, W)
+    img_fpn = (img_thr + col_noise).clamp(0.0, 1.0)
+    sigma_mean = (sigma.mean() * 255.0).item()
+    return img_fpn, sigma_mean
+
+
+def fpn_invariance_loss_fast(
+    feats_fpn: Tensor,
+    feats_clean: Tensor,
+) -> Tensor:
+    """
+    FPN 不変性損失（高速版）。
+
+    呼び出し側でノイズ付きフォワードと clean フォワードを行い、
+    その結果だけを受け取って損失を計算する。
+    fpn_invariance_loss() と異なり、内部でフォワードしない。
+
+    Args:
+        feats_fpn   : (B, C, Hf, Wf) ノイズ付き画像の特徴（学習側・L2正規化済み）
+        feats_clean : (B, C, Hf, Wf) クリーン画像の特徴（stop_gradient・L2正規化済み）
+
+    Returns:
+        loss: scalar Tensor
+    """
+    return F.mse_loss(feats_fpn, feats_clean.detach())

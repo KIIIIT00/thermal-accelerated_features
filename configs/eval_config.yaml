@@ -1,0 +1,73 @@
+# =============================================================================
+# configs/eval_config.yaml
+# キーポイント・マッチング精度評価の設定ファイル
+#
+# 使用方法:
+#   python evaluate/eval_matching.py --config configs/eval_config.yaml
+#   python evaluate/eval_matching.py --config configs/eval_config.yaml \
+#       --datasets freiburg ms2 --n_viz 10
+# =============================================================================
+
+
+# ── モデル ──────────────────────────────────────────────────────────────────
+student_weights: "checkpoints/thermal_kd/default/wandb/run-20260331_213938-azmv5hbc/files/checkpoints/rel0.1_fpn0.05_nsamples512/thermal_kd_student_100000.pth"
+teacher_weights: "weights/xfeat.pt"
+
+
+# ── データセットルートパス ───────────────────────────────────────────────────
+data_roots:
+  freiburg:   "datasets/freiburg"      # ← 実際のパスに変更してください
+  tartanrgbt: "datasets/tartanRGBT"
+  vivid:      "datasets/vivid/extracted_data"
+  sthereo:    "datasets/sthereo"
+  ms2:        "datasets/ms2"
+
+splits_roots:
+  freiburg:   null
+  tartanrgbt: null
+  vivid:      null
+  sthereo:    null
+  ms2:        null
+
+
+# ── 評価対象データセット ─────────────────────────────────────────────────────
+datasets:
+  - freiburg
+  - ms2
+  - sthereo
+  - tartanrgbt
+
+split: "val"
+
+
+# ── Homography Estimation 設定 ───────────────────────────────────────────────
+auc_thresholds: [3, 5, 10]
+n_eval_pairs: null        # null → 全件
+matching_method: "mutual_nn"
+ratio_threshold: 0.9
+max_keypoints: 2048
+
+
+# ── 可視化設定 ────────────────────────────────────────────────────────────────
+n_viz: 5
+output_dir: "evaluate/results/rel0.1_fpn0.05_nsmaples512"
+
+viz_models:
+  - teacher_rgb
+  - teacher_thr
+  - student_thr
+
+kp_radius: 3
+kp_color_teacher_rgb: [0, 255, 0]
+kp_color_teacher_thr: [0, 0, 255]
+kp_color_student_thr: [255, 128, 0]
+match_color: [255, 255, 0]
+
+viz_width: 640
+viz_height: 480
+
+
+# ── システム ─────────────────────────────────────────────────────────────────
+device_num: "0"
+num_workers: 2
+seed: 42

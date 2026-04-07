@@ -1,0 +1,168 @@
+# =============================================================================
+# configs/train_config.yaml
+# Thermal XFeat KD 訓練設定ファイル
+#
+# 優先順位: CLI引数 > このファイル > argparse ハードコードデフォルト
+# 使用方法:
+#   python train_kd.py --config configs/train_config.yaml
+#   python train_kd.py --config configs/train_config.yaml --lambda_kd_rel 0.2
+# =============================================================================
+
+
+# ── モデル ──────────────────────────────────────────────────────────────────
+teacher_weights: "weights/xfeat.pt"
+student_init: null                      # null → teacher_weights で初期化
+
+ckpt_save_path: "checkpoints/thermal_kd/default"
+
+
+# ── データセットルートパス ───────────────────────────────────────────────────
+# 優先順位: data_roots > {name}_root CLI引数 > 環境変数 ANYTHERMAL_{NAME}_DATA_ROOT
+data_roots:
+  freiburg:   "datasets/freiburg"      # ← 実際のパスに変更してください
+  tartanrgbt: "datasets/tartanRGBT"
+  vivid:      "datasets/vivid/extracted_data"
+  sthereo:    "datasets/sthereo"
+  ms2:        "datasets/ms2"
+
+
+# ── スプリットファイルのディレクトリ ─────────────────────────────────────────
+# 優先順位:
+#   1. splits_roots（ここ）
+#   2. {name}_splits_dir CLI引数
+#   3. third_party/anythermal/custom_datasets/{name}/splits/... を自動検出
+#   4. 各データセットクラスが data_root/splits/ にフォールバック
+#
+# AnyThermal (submodule) を使う場合は自動検出されるため、通常は設定不要。
+# 画像データと分離してスプリットファイルを管理している場合のみ設定する。
+splits_roots:
+  freiburg:   null   # null → 自動検出 or data_root/splits/frame_list/
+  tartanrgbt: null
+  vivid:      null
+  sthereo:    null
+  ms2:        null   # MS2 はシーケンスリストをコードで管理
+ 
+ 
+# ── データ ──────────────────────────────────────────────────────────────────
+# 訓練データセット選定方針（AnyThermal に準拠）:
+#   - 環境多様性の最大化: 都市/屋外/屋内/オフロード/昼夜をすべてカバー
+#   - RGB-T 同一シーンペアを持つデータセットのみ使用（KD に必須）
+#   - STheReO は stereo_left (RGB) + thermal8_left_clahe (Thr) でペアを構成
+#   - VIVID++ は color/ + thermal_fieldscale_clahe/ でペアを構成
+#   - MS2 は訓練に含めない（val 専用: ドメインギャップ評価に使用）
+#
+# 各データセットの特性:
+#   freiburg:   都市・昼夜ペア → diurnal_inversion 拡張の教師信号
+#   tartanrgbt: 屋内・屋外・オフロード → 多様な熱画像パターン
+#   vivid:      都市走行・夜間 → 時系列連続性・照明変化
+#   sthereo:    屋外ステレオ → 幾何整合された高品質ペア
+dataset:
+  - freiburg
+  - tartanrgbt
+  - vivid      # 前処理（rosbag展開 + Fieldscale）が完了していれば追加
+  - sthereo    # 前処理（14bit→8bit変換）が完了していれば追加
+ 
+eval_dataset:
+  - freiburg      # 昼夜変化評価（本手法の核心）
+  - ms2           # 都市走行・GPS付き（汎化性評価）
+  - sthereo       # 屋外ステレオ（幾何整合性評価）
+  - tartanrgbt    # 多様環境（train域での再現性確認）
+  - vivid         # 都市夜間（diurnal評価）
+ 
+batch_size: 64
+eval_batch_size: 8
+train_num_workers: 4
+eval_num_workers: 2
+seed: 42
+augment: true
+ 
+aug_list:
+  - affine
+  - hflip
+  - brightness
+  - contrast
+  - gamma
+  - diurnal_inversion
+ 
+intra_dataset_batch: true
+ 
+ 
+# ── AnyThermal build_dataset 互換引数（スタンドアロン時は無視）────────────
+use_odom: false
+vpr_test: false
+debug: false
+subsample_val: 1
+dist_thresh: 10.0
+val_positive_dist_threshold: 10.0
+neg_ring_outer_radius: 50.0
+teacher_modality: "rgb"
+student_modality: "thermal"
+student_modality_dual: "thermal"
+thermal_aug_list: null
+cart_split: false
+dataset_split_for_eval: "val"
+common_database: false
+train: true
+sampling_weight: "uniform"
+crop_images: false
+rescale_during_crop: false
+ 
+ 
+# ── 訓練 ────────────────────────────────────────────────────────────────────
+n_steps: 100000
+lr: 0.0003
+lr_step: 30000
+lr_gamma: 0.5
+grad_clip: 1.0
+save_ckpt_every: 5000
+eval_every:      2000   # 何ステップごとに val 評価を行うか
+log_every: 100
+ 
+ 
+# ── KD ハイパーパラメータ ────────────────────────────────────────────────────
+lambda_kd_rel: 0.1
+lambda_fpn: 0.05
+fpn_sigma_min: 2.0           # FPN 列ノイズ σ 下限 (DN / 255)
+fpn_sigma_max: 8.0           # FPN 列ノイズ σ 上限 (DN / 255)
+p_diurnal_inversion: 0.3     # 昼夜反転拡張の適用確率
+n_kd_samples: 2048           # KD 特徴損失のサブサンプリング数（cross-modal）
+infonce_temp: 0.2            # dual-softmax InfoNCE 温度
+ 
+# Relational KD（intra-modal 構造転移）
+# L_KD（cross-modal InfoNCE）が最適化しない feats_s×feats_s^T を補完する
+# 教師の点間類似度構造（T×T^T）を生徒（S×S^T）に転移
+# → Repeatability と Discriminability を直接最適化
+# ablation: lambda_relkd = 0.0 / 0.2 / 0.5 / 1.0 で効果を検証
+lambda_relkd: 0.5
+n_relkd_samples: 2024         # Relational KD のサブサンプリング数
+                             # n×n 行列を作るため n=512 → 256K 要素（メモリ注意）
+                             # n_kd_samples より小さくすることを推奨
+ 
+ 
+# ── デバイス ─────────────────────────────────────────────────────────────────
+device_num: "0"
+ 
+ 
+# ── wandb ─────────────────────────────────────────────────────────────────────
+no_wandb: false
+wandb_project: "thermal-xfeat-kd"
+wandb_run_name: rel0.5_fpn0.05_lambda0.5_n2048_relkd2034          # null → "rel{lambda_kd_rel}_fpn{lambda_fpn}" で自動生成
+wandb_group: "grid_search"
+wandb_tags:
+  - freiburg
+  - tartanrgbt
+image_log_every: 500
+ 
+ 
+# ── 高速化設定 ───────────────────────────────────────────────────────────────
+# 以下は学習速度に直接影響する設定。GPU メモリと速度のトレードオフ。
+ 
+# AMP（自動混合精度）: float32 → float16 混在で 1.5〜2x 高速化
+# XFeatModel は BN を含むため scaler 必須
+use_amp: true
+ 
+# DataLoader の設定
+# persistent_workers: ワーカーを再起動しない（エポック切り替え時のオーバーヘッド削減）
+persistent_workers: true
+# prefetch_factor: ワーカーあたりのプリフェッチバッチ数
+prefetch_factor: 2

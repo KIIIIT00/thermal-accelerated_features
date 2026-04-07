@@ -178,15 +178,22 @@ def _build_standalone_loader(args: Any) -> DataLoader:
     g = torch.Generator()
     g.manual_seed(seed)
 
-    return DataLoader(
-        combined,
+    persistent = getattr(args, 'persistent_workers', True) and num_workers > 0
+    prefetch   = getattr(args, 'prefetch_factor', 2) if num_workers > 0 else None
+
+    dl_kwargs = dict(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
         generator=g,
+        persistent_workers=persistent,
     )
+    if prefetch is not None:
+        dl_kwargs['prefetch_factor'] = prefetch
+
+    return DataLoader(combined, **dl_kwargs)
 
 
 # ---------------------------------------------------------------------------

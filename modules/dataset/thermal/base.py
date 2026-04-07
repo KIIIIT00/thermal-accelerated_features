@@ -125,8 +125,7 @@ class ThermalDatasetBase(Dataset, ABC):
             rgb, thr = self.transform(rgb, thr)
 
         return {
-            'item': [{'rgb': rgb, 'thr': thr}],
+            'item': [{'rgb': rgb, 'thr': thr, 'thr_raw': thr_orig}],
             'rgb_path': rgb_path,
             'thr_path': thr_path,
-            'thr_raw': thr_orig,   # augment 前の熱画像（diurnal 適用率計測用）
         }

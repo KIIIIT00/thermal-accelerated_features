@@ -242,7 +242,7 @@ class ThermalXFeatKDTrainer:
         self.save_every   = getattr(args, 'save_ckpt_every',     2_000)
         self.log_every    = getattr(args, 'log_every',           100)
         self.eval_every   = getattr(args, 'eval_every',           2_000)
-        self.image_log_every = getattr(args, 'image_log_every',  500)
+        self.image_log_every = getattr(args, 'image_log_every',  10000)
         self.ckpt_path    = getattr(args, 'ckpt_save_path',      'checkpoints')
 
         os.makedirs(self.ckpt_path, exist_ok=True)

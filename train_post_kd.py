@@ -30,6 +30,44 @@ import os
 import sys
 from typing import Any, Optional
 
+# ── CUDA_VISIBLE_DEVICES を import torch より前に設定 ──────────────────────
+# torch を import した時点で GPU が確定するため、
+# argparse で取得した device_num を使って最速で設定する。
+def _set_cuda_visible_devices_early() -> None:
+    """
+    sys.argv から --device_num / --config を解析して
+    CUDA_VISIBLE_DEVICES を import torch より前に設定する。
+    """
+    device_num = '0'  # デフォルト
+
+    # 1. --device_num を直接探す
+    for i, arg in enumerate(sys.argv):
+        if arg == '--device_num' and i + 1 < len(sys.argv):
+            device_num = sys.argv[i + 1]
+            break
+
+    # 2. --config から device_num を読む（--device_num が未指定の場合）
+    if device_num == '0':
+        config_path = None
+        for i, arg in enumerate(sys.argv):
+            if arg == '--config' and i + 1 < len(sys.argv):
+                config_path = sys.argv[i + 1]
+                break
+        if config_path and os.path.isfile(config_path):
+            try:
+                import yaml  # yaml は torch に依存しないので safe
+                cfg = yaml.safe_load(open(config_path)) or {}
+                device_num = str(cfg.get('device_num', '0'))
+            except Exception:
+                pass
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = device_num
+    print(f"[Device] CUDA_VISIBLE_DEVICES={device_num}")
+
+
+_set_cuda_visible_devices_early()
+# ──────────────────────────────────────────────────────────────────────────
+
 
 # ---------------------------------------------------------------------------
 # YAML ロードヘルパー
@@ -228,6 +266,46 @@ def _get_data_root(name: str, args: Any) -> str:
     return root
 
 
+def _get_splits_dir(name: str, args: Any) -> object:
+    """
+    splits_dir を loader.py の _resolve_splits_dir() と同じ優先順位で解決する。
+
+    優先順位:
+        1. args.splits_roots[name] / args.{name}_splits_dir
+        2. third_party/anythermal/custom_datasets/{name}/splits/... を自動検出
+        3. None → 各データセットクラスが data_root/splits/ にフォールバック
+    """
+    # 優先度1: 明示的な設定
+    splits_dir = (getattr(args, 'splits_roots', None) or {}).get(name, '')
+    if not splits_dir:
+        splits_dir = getattr(args, f'{name}_splits_dir', '') or ''
+    if splits_dir:
+        return splits_dir
+
+    # 優先度2: third_party/anythermal サブモジュールから自動検出
+    _SPLITS_SUBPATH = {
+        'freiburg':   os.path.join('freiburg',   'splits', 'frame_list'),
+        'tartanrgbt': os.path.join('tartanRGBT', 'splits'),
+        'vivid':      os.path.join('vivid',      'splits', 'frame_lists'),
+        'sthereo':    os.path.join('sthereo',    'splits', 'frame_lists'),
+    }
+    # train_post_kd.py は プロジェクトルートに置かれているので __file__ から計算
+    _THIS     = os.path.abspath(__file__)
+    _REPO     = os.path.dirname(_THIS)
+    _SUBMOD   = os.path.join(_REPO, 'third_party', 'anythermal')
+    _CUST_DS  = os.path.join(_SUBMOD, 'custom_datasets')
+
+    subpath   = _SPLITS_SUBPATH.get(name, '')
+    if subpath:
+        candidate = os.path.join(_CUST_DS, subpath)
+        if os.path.isdir(candidate):
+            print(f"[PostKD] {name}: splits_dir auto-detected → {candidate}")
+            return candidate
+
+    # 優先度3: None（データセットクラス側でフォールバック）
+    return None
+
+
 def build_stage1_loader(args: Any):
     import torch
     from torch.utils.data import ConcatDataset, DataLoader
@@ -243,8 +321,8 @@ def build_stage1_loader(args: Any):
         if name_l not in _CLS:
             raise ValueError(f"[Stage1] Unsupported dataset: {name!r}")
 
-        root      = _get_data_root(name_l, args)
-        splits_dir = getattr(args, f'{name_l}_splits_dir', None)
+        root       = _get_data_root(name_l, args)
+        splits_dir = _get_splits_dir(name_l, args)   # 自動検出を使う
 
         base_ds = _CLS[name_l](
             data_root=root, splits_dir=splits_dir,
@@ -283,8 +361,8 @@ def build_stage2_loader(args: Any):
         if name_l not in _CLS:
             raise ValueError(f"[Stage2] Unsupported dataset: {name!r}")
 
-        root      = _get_data_root(name_l, args)
-        splits_dir = getattr(args, f'{name_l}_splits_dir', None)
+        root       = _get_data_root(name_l, args)
+        splits_dir = _get_splits_dir(name_l, args)   # 自動検出を使う
         kwargs    = dict(data_root=root, splits_dir=splits_dir,
                          stride=args.s2_stride)
         ds = _CLS[name_l](**kwargs)

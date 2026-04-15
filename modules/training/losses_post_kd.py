@@ -3,13 +3,16 @@ modules/training/losses_post_kd.py
 Post-KD 訓練の損失関数。
 
 Stage 1: Thermal Homographic Adaptation
-  - repeatability_loss()        : キーポイント再現性損失
-  - fine_matching_loss()        : fine matcher サブピクセル損失
+  - repeatability_loss()                   : キーポイント再現性損失
+  - fine_matching_loss()                   : fine matcher サブピクセル損失
 
-Stage 2: 幾何整合ファインチューニング
-  - reprojection_loss()         : 再投影誤差損失
-  - epipolar_loss()             : エピポーラ拘束損失
-  - sampson_distance()          : Sampson距離（エピポーラの滑らかな近似）
+Stage 2: 幾何整合ファインチューニング（案C: GT投影特徴損失）
+  - geometric_feature_consistency_loss()   : GT投影+特徴空間損失（メイン）
+      1. hmap_t 上位N点を pts1 として選択（no_grad）
+      2. T_rel と K で pts1 を pts2_gt に投影（no_grad・純幾何計算）
+      3. feats_t[pts1] vs feats_t1[pts2_gt] のコサイン類似度損失（勾配あり）
+      4. エピポーラ Sampson 距離を重みとして付与（勾配なし）
+  - sampson_distance()                     : Sampson距離（エピポーラの近似）
 
 NOTE:
   losses.py / alike_wrapper は import しない（ALIKE 依存禁止）
@@ -108,46 +111,71 @@ def repeatability_loss(
     """
     キーポイント再現性損失（Stage 1 主損失）。
 
-    物理的根拠:
-      KD で適応済みの信頼性マップ（hmap_frozen）は
-      「熱画像のどこが特徴的か」を既に知っている。
-      これをキーポイントブランチの教師信号として活用し、
-      ホモグラフィー変換下で同じ点を繰り返し検出するよう学習させる。
+    【修正履歴】
+      旧実装の問題:
+        1. loss_guide = -(hmap_frozen * kp_score).mean()
+           → hmap_frozen が上部に集中していると kp_score も上部に引き寄せられる
+           → 下部では hmap_frozen ≈ 0 なので勾配がゼロ = 下部が学習されない
+        2. mask = (hmap_warped > threshold) & (hmap_w_frozen > threshold)
+           → hmap が上部にしか高い値を持たないとき、下部は mask=0 で
+              repeatability_loss の勾配もゼロ = 下部が一切学習されない
+        3. kp_score を softmax(64ch).max() で計算
+           → dustbin チャンネル(ch.64)を無視するため「キーポイントなし」を
+             正しく表現できない
+
+      修正内容:
+        1. loss_guide を削除（hmap のバイアスを kp_logits に伝播させない）
+        2. mask を均一（ホモグラフィーの有効領域のみ）に変更
+           → 画像全体でキーポイント検出を学習する
+        3. kp_score を 65ch softmax の非dustbin確率の和として計算
+           = P(キーポイントあり) = 1 - P(dustbin)
+           → dustbin が高い領域では kp_score が低くなり正しく表現できる
+
+    【マスクの意味】
+      valid_mask: ホモグラフィー変換後に画像内に収まる領域のみで損失を計算。
+      hmap に依存しないため空間バイアスを生じさせない。
 
     Args:
         kp_logits    : (B, 65, Hf, Wf)  元画像のキーポイントロジット（学習中）
         kp_logits_w  : (B, 65, Hf, Wf)  変換後画像のキーポイントロジット（学習中）
         H_mat        : (B, 3, 3)         ホモグラフィー行列（元→変換後）
-        hmap_frozen  : (B, 1, H, W)      元画像の信頼性マップ（KD済み・frozen）
-        hmap_w_frozen: (B, 1, H, W)      変換後画像の信頼性マップ（KD済み・frozen）
-        threshold    : 信頼性マスクの閾値
+        hmap_frozen  : (B, 1,  Hf, Wf)  信頼性マップ（本修正では mask に使用しない）
+        hmap_w_frozen: (B, 1,  Hf, Wf)  信頼性マップ（本修正では mask に使用しない）
+        threshold    : 未使用（後方互換のために引数は保持）
 
     Returns:
         loss: scalar
     """
-    # キーポイントスコアに変換 (B, 1, H, W)
-    kp_score   = _get_kpts_heatmap(kp_logits)
-    kp_score_w = _get_kpts_heatmap(kp_logits_w)
+    # ── キーポイントスコアの計算（65ch softmax で dustbin を考慮）────────────
+    # P(keypoint) = sum of non-dustbin probs = 1 - P(dustbin)
+    # 旧: softmax(64ch).max() → dustbin を無視 → 常に高い値になる
+    # 新: softmax(65ch)[:64].sum() → dustbin が高いとスコアが低くなる
+    probs     = F.softmax(kp_logits,   dim=1)          # (B, 65, Hf, Wf)
+    probs_w   = F.softmax(kp_logits_w, dim=1)
+    kp_score   = probs[:, :64].sum(dim=1, keepdim=True)    # (B, 1, Hf, Wf)
+    kp_score_w = probs_w[:, :64].sum(dim=1, keepdim=True)  # (B, 1, Hf, Wf)
 
-    # kp_score を H_mat で変換後画像へワープ
-    kp_score_warped = _warp_map(kp_score, H_mat, mode='bilinear')  # (B,1,H,W)
+    # ── ワープ ───────────────────────────────────────────────────────────────
+    kp_score_warped = _warp_map(kp_score, H_mat, mode='bilinear')  # (B,1,Hf,Wf)
 
-    # 信頼性マスク: 両方で高信頼な領域のみで損失を計算
-    # ワープした領域で hmap_frozen も一緒にワープ
-    hmap_warped = _warp_map(hmap_frozen, H_mat, mode='bilinear')
-    mask = ((hmap_warped > threshold) & (hmap_w_frozen > threshold)).float()
+    # ── 均一マスク: ホモグラフィーの有効領域のみ ────────────────────────────
+    # ゼロ埋めで外側にはみ出た画素は grid_sample で 0 になる。
+    # warped 後の kp_score が 0 より大きい領域 = 有効領域。
+    # hmap に依存しないため空間バイアスを生じさせない。
+    with torch.no_grad():
+        # 全1テンソルをワープして有効領域マスクを生成
+        ones    = torch.ones_like(kp_score)
+        valid_mask = (_warp_map(ones, H_mat, mode='nearest') > 0.5).float()
+    # (B, 1, Hf, Wf)
 
-    # 再現性損失: ワープ後スコア ≈ 変換後スコア（マスク領域で）
-    diff = (kp_score_warped - kp_score_w) ** 2
-    denom = mask.sum().clamp(min=1.0)
-    loss_repeat = (diff * mask).sum() / denom
+    # ── 再現性損失 ────────────────────────────────────────────────────────────
+    diff  = (kp_score_warped - kp_score_w) ** 2   # (B, 1, Hf, Wf)
+    denom = valid_mask.sum().clamp(min=1.0)
+    loss_repeat = (diff * valid_mask).sum() / denom
 
-    # 信頼性ガイド損失: 信頼性が高い場所でキーポイントスコアも高くなるよう誘導
-    # L = -mean(hmap * kp_score) → 最大化 = hmap が高い場所で kp_score も高くする
-    loss_guide = -(hmap_frozen * kp_score).mean() \
-               - (hmap_w_frozen * kp_score_w).mean()
-
-    return loss_repeat + 0.1 * loss_guide
+    # loss_guide は削除（hmap バイアスの伝播を防ぐ）
+    # 旧: loss_repeat + 0.1 * loss_guide
+    return loss_repeat
 
 
 def fine_matching_loss(
@@ -415,3 +443,208 @@ try:
     from typing import Optional
 except ImportError:
     Optional = None
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: 幾何整合損失（案C: GT投影特徴損失）
+# ---------------------------------------------------------------------------
+
+def _project_pts(
+    pts1: Tensor,
+    K: Tensor,
+    T_rel: Tensor,
+) -> Tensor:
+    """
+    pts1 を T_rel と K を使って画像2上に投影する（純粋な幾何計算）。
+
+    Args:
+        pts1  : (N, 2) 画像1上の点（画素座標、[x, y]）
+        K     : (3, 3) カメラ内部行列
+        T_rel : (4, 4) 相対姿勢 T_{1→2}
+
+    Returns:
+        pts2_proj : (N, 2) 画像2上の投影点（画素座標）
+        valid_mask: (N,)   bool（投影点がdepth > 0 の有効点）
+    """
+    N = pts1.shape[0]
+    ones = pts1.new_ones(N, 1)
+    p1h  = torch.cat([pts1, ones], dim=1).T          # (3, N)
+
+    # torch.inverse は GPU 上の小行列で cuSOLVER エラーになる場合がある
+    # K は (3,3) の小行列なので CPU で逆行列を計算して GPU に戻す
+    K_cpu   = K.cpu().double()
+    K_inv   = torch.inverse(K_cpu).float().to(pts1.device)
+
+    p1n   = K_inv @ p1h                              # (3, N) 正規化座標
+
+    R = T_rel[:3, :3]
+    t = T_rel[:3, 3:4]                               # (3, 1)
+    p2n = R @ p1n + t                                # (3, N)
+
+    pts2_proj_h = K @ p2n                            # (3, N)
+    depth       = p2n[2:3, :]                        # (1, N)
+    valid_mask  = (depth[0] > 1e-4)                  # (N,)
+
+    d_safe      = depth.clamp(min=1e-8)
+    pts2_proj   = (pts2_proj_h[:2, :] / d_safe).T   # (N, 2)
+
+    return pts2_proj, valid_mask
+
+
+def _sample_feats(
+    feats: Tensor,
+    pts_px: Tensor,
+    H: int,
+    W: int,
+) -> Tensor:
+    """
+    特徴マップ feats: (C, Hf, Wf) から pts_px の位置の特徴を双線形補間でサンプリング。
+
+    Args:
+        feats  : (C, Hf, Wf)  特徴マップ（1バッチ分）
+        pts_px : (N, 2)       画素座標 [x, y]（フル解像度）
+        H, W   : int          元画像のフル解像度
+
+    Returns:
+        sampled: (N, C)
+    """
+    C, Hf, Wf = feats.shape
+    N = pts_px.shape[0]
+
+    # 画素座標 → 特徴マップ座標 → grid_sample 用正規化座標 [-1, 1]
+    # feats は stride=8 → 特徴マップ座標 = pts_px / 8
+    fx = pts_px[:, 0] / W * 2.0 - 1.0   # x を [-1, 1] に正規化
+    fy = pts_px[:, 1] / H * 2.0 - 1.0   # y を [-1, 1] に正規化
+    grid = torch.stack([fx, fy], dim=1)  # (N, 2)
+    # grid_sample は (B, C, H, W) x (B, N_out_H, N_out_W, 2) の形式
+    grid = grid.view(1, 1, N, 2)         # (1, 1, N, 2)
+    feats4d = feats.unsqueeze(0)         # (1, C, Hf, Wf)
+
+    sampled = F.grid_sample(
+        feats4d, grid,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=False,
+    )  # (1, C, 1, N)
+    sampled = sampled[0, :, 0, :].T      # (N, C)
+    return sampled
+
+
+def geometric_feature_consistency_loss(
+    feats_t:  Tensor,
+    feats_t1: Tensor,
+    hmap_t:   Tensor,
+    K:        Tensor,
+    T_rel:    Tensor,
+    H: int,
+    W: int,
+    n_pts: int = 256,
+    epi_weight_scale: float = 2.0,
+    margin: int = 8,
+) -> Tensor:
+    """
+    GT投影特徴整合損失（Stage 2 メイン損失）。
+
+    【設計方針: 案C】
+      対応点を「現在のモデルの予測」ではなく
+      「GTポーズ T_rel と K による3D投影」で決定する。
+      これにより:
+        - 幾何情報（T_rel, K）を正しく使用
+        - 対応点がモデル出力に依存しない（鶏と卵の問題なし）
+        - feats への勾配が正常に流れる（backward() が成功する）
+
+    【処理フロー】
+      1. hmap_t 上位 n_pts 点を pts1 として選択（no_grad）
+      2. T_rel, K で pts1 → pts2_gt に投影（no_grad・純幾何）
+      3. 画像範囲内の点のみに絞る（valid_mask）
+      4. feats_t[pts1] と feats_t1[pts2_gt] を双線形補間でサンプリング
+      5. コサイン類似度損失（正の対応 = 一致させる）
+      6. エピポーラ Sampson 距離を重みとして付与（detach・勾配なし）
+
+    Args:
+        feats_t   : (C, Hf, Wf)  フレーム t の特徴マップ（学習側・勾配あり）
+        feats_t1  : (C, Hf, Wf)  フレーム t+1 の特徴マップ（学習側・勾配あり）
+        hmap_t    : (1, Hf, Wf)  フレーム t の信頼性マップ（no_grad で取得）
+        K         : (3, 3)        カメラ内部行列
+        T_rel     : (4, 4)        相対姿勢 T_{t→t+1}
+        H, W      : int           元画像のフル解像度
+        n_pts     : int           使用するキーポイント数
+        epi_weight_scale: float  Sampson 距離のソフト重みのスケール
+        margin    : int           画像端のマージン（画素）
+
+    Returns:
+        loss: scalar Tensor（勾配あり）
+    """
+    # ── 1. キーポイント選択（hmap 上位 n_pts 点） ────────────────────────
+    # hmap は no_grad で取得済み → ここは純粋なインデックス操作
+    Hf, Wf = hmap_t.shape[-2], hmap_t.shape[-1]
+    flat    = hmap_t[0].reshape(-1)                          # (Hf*Wf,)
+    k       = min(n_pts, flat.numel())
+    _, topk = torch.topk(flat, k=k)
+    iy1f    = topk // Wf                                     # 特徴マップ y
+    ix1f    = topk % Wf                                      # 特徴マップ x
+
+    # 特徴マップ座標 → 画素座標（セル中心: *8 + 4）
+    px1 = ix1f.float() * 8.0 + 4.0                          # (k,)
+    py1 = iy1f.float() * 8.0 + 4.0
+    pts1 = torch.stack([px1, py1], dim=1)                    # (k, 2)
+
+    # ── 2. GT投影: T_rel, K で pts2_gt を計算（no_grad） ────────────────
+    with torch.no_grad():
+        pts2_gt, valid_depth = _project_pts(pts1, K, T_rel)
+
+        # 画像範囲チェック
+        in_bounds = (
+            (pts2_gt[:, 0] >= margin) &
+            (pts2_gt[:, 0] <  W - margin) &
+            (pts2_gt[:, 1] >= margin) &
+            (pts2_gt[:, 1] <  H - margin) &
+            valid_depth
+        )
+        # pts1 も範囲チェック（念のため）
+        in_bounds_1 = (
+            (pts1[:, 0] >= margin) &
+            (pts1[:, 0] <  W - margin) &
+            (pts1[:, 1] >= margin) &
+            (pts1[:, 1] <  H - margin)
+        )
+        valid = in_bounds & in_bounds_1
+
+    if valid.sum() < 4:
+        # 有効点が少なすぎる場合は None を返してループ側でスキップする
+        # （feats_t.new_zeros() は requires_grad=False なので backward が壊れる）
+        return None
+
+    pts1_v   = pts1[valid]                                   # (N_v, 2)
+    pts2_v   = pts2_gt[valid]                                # (N_v, 2)
+
+    # ── 3. 特徴サンプリング（双線形補間・勾配あり） ──────────────────────
+    f1 = _sample_feats(feats_t,  pts1_v, H, W)              # (N_v, C)
+    f2 = _sample_feats(feats_t1, pts2_v, H, W)              # (N_v, C)
+
+    # ── 4. コサイン類似度損失 ────────────────────────────────────────────
+    cos_sim  = F.cosine_similarity(f1, f2, dim=1)            # (N_v,)
+    loss_cos = 1.0 - cos_sim                                 # 低いほど良い
+
+    # ── 5. エピポーラ Sampson 重み（detach・勾配なし） ───────────────────
+    # エピポーラ拘束に合う点ほど高い重みで学習させる
+    # ただし重み自体は座標値から計算するため detach して勾配を切る
+    with torch.no_grad():
+        R   = T_rel[:3, :3]
+        t   = T_rel[:3, 3]
+        t_s = torch.zeros(3, 3, device=t.device, dtype=t.dtype)
+        t_s[0,1] = -t[2]; t_s[0,2] =  t[1]
+        t_s[1,0] =  t[2]; t_s[1,2] = -t[0]
+        t_s[2,0] = -t[1]; t_s[2,1] =  t[0]
+        E     = t_s @ R
+        # torch.inverse は GPU 小行列で cuSOLVER エラーになる場合があるため CPU で計算
+        K_inv = torch.inverse(K.cpu().double()).float().to(K.device)
+        F_mat = K_inv.T @ E @ K_inv
+        epi_dist = sampson_distance(pts1_v, pts2_v, F_mat)  # (N_v,)
+        epi_w    = torch.exp(
+            -epi_dist / (epi_weight_scale ** 2)
+        ).clamp(min=0.0, max=1.0)                           # (N_v,) ∈ [0,1]
+
+    # 重み付き平均損失
+    loss = (loss_cos * epi_w).sum() / epi_w.sum().clamp(min=1.0)
+    return loss

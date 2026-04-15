@@ -242,7 +242,7 @@ class ThermalXFeatKDTrainer:
         self.save_every   = getattr(args, 'save_ckpt_every',     2_000)
         self.log_every    = getattr(args, 'log_every',           100)
         self.eval_every   = getattr(args, 'eval_every',           2_000)
-        self.image_log_every = getattr(args, 'image_log_every',  10000)
+        self.image_log_every = getattr(args, 'image_log_every',  500)
         self.ckpt_path    = getattr(args, 'ckpt_save_path',      'checkpoints')
 
         os.makedirs(self.ckpt_path, exist_ok=True)
@@ -571,23 +571,38 @@ class ThermalXFeatKDTrainer:
 
             # ── チェックポイント保存 ──────────────────────────────────────
             if (step + 1) % self.save_every == 0:
-                ckpt_file = os.path.join(
-                    self.ckpt_path, f'thermal_kd_student_{step + 1}.pth')
+                filename  = f'thermal_kd_student_{step + 1}.pth'
+                ckpt_file = os.path.join(self.ckpt_path, filename)
                 torch.save(self.student.state_dict(), ckpt_file)
-                print(f"[Trainer] Checkpoint saved: {ckpt_file}")
+                print(f"[Trainer] Checkpoint saved (local): {ckpt_file}")
                 if self.use_wandb:
                     try:
                         import wandb
-                        wandb.save(ckpt_file)
-                    except Exception:
-                        pass
+                        if wandb.run is not None:
+                            wandb_path = os.path.join(wandb.run.dir, filename)
+                            torch.save(self.student.state_dict(), wandb_path)
+                            wandb.save(wandb_path, base_path=wandb.run.dir)
+                            print(f"[Trainer] Checkpoint saved (wandb): {wandb_path}")
+                    except Exception as e:
+                        print(f"[Trainer] WARNING: wandb save failed: {e}")
 
             step += 1
 
         # 最終保存
-        final_ckpt = os.path.join(self.ckpt_path, 'thermal_kd_student_final.pth')
+        final_filename = 'thermal_kd_student_final.pth'
+        final_ckpt = os.path.join(self.ckpt_path, final_filename)
         torch.save(self.student.state_dict(), final_ckpt)
-        print(f"[Trainer] Training done. Final checkpoint: {final_ckpt}")
+        print(f"[Trainer] Training done. Final checkpoint (local): {final_ckpt}")
+        if self.use_wandb:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb_final = os.path.join(wandb.run.dir, final_filename)
+                    torch.save(self.student.state_dict(), wandb_final)
+                    wandb.save(wandb_final, base_path=wandb.run.dir)
+                    print(f"[Trainer] Final checkpoint (wandb): {wandb_final}")
+            except Exception as e:
+                print(f"[Trainer] WARNING: wandb final save failed: {e}")
         self._finalize()
 
     @torch.no_grad()

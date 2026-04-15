@@ -116,8 +116,20 @@ class TartanRGBTSequentialDataset(Dataset):
         self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
         # (thr_path_t, thr_path_t1, T_rel, K)
 
-        for _, dir_name in seq_map.items():
-            seq_dir = os.path.join(data_root, dir_name)
+        # sequence.yaml の構造: {'traj_list': {key: label, ...}}
+        # キー = 'day1/undistorted_images_...', 値 = 'indoor_SQH_office'
+        # 実際のパス = {data_root}/day1/indoor_SQH_office/
+        traj_map = seq_map.get('traj_list', seq_map)  # traj_list キーを剥がす
+
+        for key, label in traj_map.items():
+            if not isinstance(label, str):
+                continue
+            # キーの先頭要素 ('day1') + ラベル名でパスを解決
+            day_prefix = key.split('/')[0]
+            seq_dir = os.path.join(data_root, day_prefix, label)
+            # フォールバック: キーをそのままパスとして使う
+            if not os.path.isdir(seq_dir):
+                seq_dir = os.path.join(data_root, key)
             thr_dir = os.path.join(seq_dir, 'thermal_left_rect_8')
             pose_path = os.path.join(seq_dir, 'pose_left_rect.txt')
             ffc_path  = os.path.join(seq_dir, 'thermal_left_ffc', 'data.txt')

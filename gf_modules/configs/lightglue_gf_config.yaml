@@ -1,0 +1,144 @@
+# =============================================================================
+# configs/lightglue_gf_config.yaml
+# LightGlue Fine-tuning（glue-factory 使用）設定ファイル
+#
+# XFeat が LightGlue を学習したのと同じフレームワーク（glue-factory）を使用。
+#
+# 学習データ:  Freiburg (train) + TartanRGBT (train)  ← 合成ホモグラフィー
+# 評価データ:  SThErEO, VIVID（fine-tuning に一切使用しない）
+#
+# 使用方法:
+#   python train_lightglue_gf.py --config configs/lightglue_gf_config.yaml
+# =============================================================================
+
+
+# ── モデル設定 ────────────────────────────────────────────────────────────────
+# gluefactory の TwoViewPipeline を使用
+# name は gluefactory が解決できるモジュールパスまたは登録名
+
+model:
+  name: two_view_pipeline
+
+  extractor:
+    name: gf_modules.models.thermal_xfeat.ThermalXFeat
+    weights: "checkpoints/post_kd/default/post_kd_s2_final.pth"
+    max_num_keypoints: 512
+    remove_borders: 4
+    detection_threshold: 0.0
+
+  matcher:
+    name: matchers.lightglue
+    features: null            # features=null + input_dim=64 で 64次元対応
+    input_dim: 64
+    descriptor_dim: 256
+    n_layers: 9
+    num_heads: 4
+    flash: false
+    mp: false
+    depth_confidence: -1
+    width_confidence: -1
+    filter_threshold: 0.1
+    weights: null             # ランダム初期化（Thermal 向けに fine-tuning）
+
+  # GT 対応点の生成方法（ホモグラフィーから正確な対応を計算）
+  ground_truth:
+    name: homography_correspondences
+    th_positive: 3.0
+    th_negative: 5.0
+    th_epi: 1.0
+    reward_positive: 1.0
+    reward_negative: -0.25
+
+
+# ── データセット設定 ──────────────────────────────────────────────────────────
+data:
+  name: gf_modules.datasets.thermal_homography.ThermalHomographyDataset
+
+  train_datasets:
+    - freiburg
+    - tartanrgbt
+
+  val_datasets:
+    - freiburg     # validation は Freiburg の val split で行う
+
+  data_roots:
+    freiburg:   "datasets/freiburg"
+    tartanrgbt: "datasets/tartanRGBT"
+
+  splits_roots:
+    freiburg:   null
+    tartanrgbt: null
+
+  image_size: [480, 640]
+
+  # ホモグラフィー生成パラメータ
+  perspective_range:  0.10
+  rotation_range:    15.0
+  scale_range:        0.20
+  translation_range:  0.10
+
+  # 1 epoch あたりのサンプル数
+  train_size: 100000
+  val_size:     2000
+  seed: 42
+
+
+# ── 学習設定 ──────────────────────────────────────────────────────────────────
+# gluefactory/train.py が参照するキーをすべて定義する
+# （未定義キーは omegaconf.ConfigKeyError になる）
+
+train:
+  seed: 42                   # gluefactory train.py が必須参照するキー
+
+  # エポック・バッチ
+  epochs:       50
+  batch_size:   32
+  num_workers:  4
+  persistent_workers: true
+  prefetch_factor: 2
+
+  # オプティマイザ
+  optimizer: adam
+  opt_regexp: null            # パラメータ正規表現フィルタ（null = 全パラメータ）
+  optimizer_options: {}
+  lr: 1.0e-4
+
+  # 学習率スケジューラー
+  lr_schedule:
+    type: exp                 # exponential decay
+    start: 0.5
+    exp_div_10: 0
+    num_steps: 250000
+
+  lr_scaling: []              # レイヤー別 lr スケーリング（空 = 全層同じ）
+
+  # 正則化
+  clip_grad: 1.0             # grad_clip_norm
+
+  # ログ・保存
+  log_every_iter:   100
+  eval_every_iter:  1000
+  save_every_iter:  5000
+  keep_last_checkpoints: 3
+
+  # 評価指標
+  best_key: "loss/total"
+  median_metrics: []
+  recall_metrics: {}
+
+  # Fine-tuning 設定
+  load_experiment: null       # 事前学習済み実験をロード
+  finetune: null              # fine-tuning 元の実験名
+
+  # データセットコールバック（未使用）
+  dataset_callback_fn: null
+  dataset_callback_time: "iter"
+
+
+# ── 出力 ─────────────────────────────────────────────────────────────────────
+# gluefactory は outputs/{experiment_name}/ に保存する
+# experiment_name は train_lightglue_gf.py で指定
+
+
+# ── デバイス ─────────────────────────────────────────────────────────────────
+device_num: "0"

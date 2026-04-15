@@ -125,7 +125,7 @@ lambda_fpn: 0.05
 fpn_sigma_min: 2.0           # FPN 列ノイズ σ 下限 (DN / 255)
 fpn_sigma_max: 8.0           # FPN 列ノイズ σ 上限 (DN / 255)
 p_diurnal_inversion: 0.3     # 昼夜反転拡張の適用確率
-n_kd_samples: 2048           # KD 特徴損失のサブサンプリング数（cross-modal）
+n_kd_samples: 512           # KD 特徴損失のサブサンプリング数（cross-modal）
 infonce_temp: 0.2            # dual-softmax InfoNCE 温度
  
 # Relational KD（intra-modal 構造転移）
@@ -134,7 +134,7 @@ infonce_temp: 0.2            # dual-softmax InfoNCE 温度
 # → Repeatability と Discriminability を直接最適化
 # ablation: lambda_relkd = 0.0 / 0.2 / 0.5 / 1.0 で効果を検証
 lambda_relkd: 0.5
-n_relkd_samples: 2024         # Relational KD のサブサンプリング数
+n_relkd_samples: 256         # Relational KD のサブサンプリング数
                              # n×n 行列を作るため n=512 → 256K 要素（メモリ注意）
                              # n_kd_samples より小さくすることを推奨
  
@@ -151,7 +151,7 @@ wandb_group: "grid_search"
 wandb_tags:
   - freiburg
   - tartanrgbt
-image_log_every: 500
+image_log_every: 10000
  
  
 # ── 高速化設定 ───────────────────────────────────────────────────────────────

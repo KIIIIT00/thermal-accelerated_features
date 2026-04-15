@@ -3,20 +3,34 @@
 # キーポイント・マッチング精度評価の設定ファイル
 #
 # 使用方法:
-#   python evaluate/eval_matching.py --config configs/eval_config.yaml
-#   python evaluate/eval_matching.py --config configs/eval_config.yaml \
-#       --datasets freiburg ms2 --n_viz 10
+#   python evaluate.py --config configs/eval_config.yaml
+#   python evaluate.py --config configs/eval_config.yaml --n_pairs 100
 # =============================================================================
 
 
-# ── モデル ──────────────────────────────────────────────────────────────────
-student_weights: "checkpoints/thermal_kd/default/wandb/run-20260331_213938-azmv5hbc/files/checkpoints/rel0.1_fpn0.05_nsamples512/thermal_kd_student_100000.pth"
+# ── evaluate.py 用モデルリスト ────────────────────────────────────────────────
+# 比較したいモデルをここに列挙する。
+# weights に null を指定するとランダム重み（デバッグ用）。
+models:
+  - name: "xfeat_thermal_baseline"
+    weights: "weights/xfeat.pt"
+    modality: "thermal"
+    description: "XFeat(RGB weights) on thermal [KD前ベースライン]"
+
+  - name: "thermal_xfeat_proposed"
+    weights: "checkpoints/post_kd/default/post_kd_s2_final.pth"
+    modality: "thermal"
+    description: "ThermalFeat KD+Stage1+Stage2 [提案手法]"
+
+
+# ── evaluate/eval_matching.py 用（単体実行時のモデル設定）─────────────────────
+student_weights: "checkpoints/post_kd/default/post_kd_s2_final.pth"
 teacher_weights: "weights/xfeat.pt"
 
 
 # ── データセットルートパス ───────────────────────────────────────────────────
 data_roots:
-  freiburg:   "datasets/freiburg"      # ← 実際のパスに変更してください
+  freiburg:   "datasets/freiburg"
   tartanrgbt: "datasets/tartanRGBT"
   vivid:      "datasets/vivid/extracted_data"
   sthereo:    "datasets/sthereo"
@@ -31,27 +45,65 @@ splits_roots:
 
 
 # ── 評価対象データセット ─────────────────────────────────────────────────────
+# evaluate.py が参照するキー
+# 優先度: SThErEO・VIVID（評価専用・fine-tuning 未使用）を必ず含める
+eval_dataset:
+  - freiburg    # GT ポーズなし → RANSAC 評価
+  - tartanrgbt  # GT ポーズあり → エピポーラ距離評価（最も正確）
+  - sthereo     # GT ポーズなし → RANSAC 評価（評価専用・汎化の指標）
+  - vivid       # GT ポーズなし → RANSAC 評価（評価専用・汎化の指標）
+
+# evaluate/eval_matching.py 単体実行時が参照するキー
 datasets:
   - freiburg
-  - ms2
-  - sthereo
-  - tartanrgbt
 
 split: "val"
 
 
+# ── 評価ペア数 ────────────────────────────────────────────────────────────────
+# null → 全件（freiburg は 4329 件で時間がかかるため最初は 200 程度を推奨）
+# evaluate.py が参照するキー
+n_pairs: 200
+
+# evaluate/eval_matching.py 単体実行時が参照するキー
+n_eval_pairs: 200
+
+
 # ── Homography Estimation 設定 ───────────────────────────────────────────────
 auc_thresholds: [3, 5, 10]
-n_eval_pairs: null        # null → 全件
-matching_method: "mutual_nn"
+
+# マッチング手法: "mutual_nn" | "lightglue"
+# LightGlue を使う場合は lightglue_weights も設定する
+matching_method: "lightglue"
+
+# glue-factory が保存する形式: outputs/training/{experiment}/checkpoint_best.tar
+# MNN で評価する場合は以下を null にするか matching_method を mutual_nn に変更
+lightglue_weights: "third_party/glue-factory/outputs/training/thermal_xfeat_lg_v3/checkpoint_best.tar"
+
 ratio_threshold: 0.9
 max_keypoints: 2048
 
+# エピポーラ評価の設定
+# use_epipolar_fallback: True → GT ポーズなし時も 8点法 F 行列で評価
+#   Freiburg 等の前方移動シーンでホモグラフィー失敗（AUC=0%）を防ぐ
+use_epipolar_fallback: true
+epi_th: 5.0    # エピポーラ線への距離閾値（画素単位）インライア判定に使用
 
-# ── 可視化設定 ────────────────────────────────────────────────────────────────
+# TartanRGBT の評価 stride（1=連続フレーム=trivial, 5〜10 を推奨）
+tartanrgbt_eval_stride: 5
+
+
+# ── 出力設定 ─────────────────────────────────────────────────────────────────
+output_dir: "evaluate/results"
+save_metrics_json: true
+save_metrics_csv: true
+save_figures: true
+save_match_images: true
+n_vis_samples: 5          # マッチング可視化の枚数
+
+
+# ── 可視化設定（eval_matching.py 単体実行用） ────────────────────────────────
 n_viz: 5
-output_dir: "evaluate/results/rel0.1_fpn0.05_nsmaples512"
-
 viz_models:
   - teacher_rgb
   - teacher_thr

@@ -14,7 +14,7 @@ kd_train_config: "configs/train_config.yaml"
  
 # kd_weights を直接指定したい場合はここに書く（kd_train_config より優先）
 # kd_weights: "checkpoints/thermal_kd/default/thermal_kd_student_final.pth"
-kd_weights: null   # null → kd_train_config から自動導出
+kd_weights: "checkpoints/post_kd/default/wandb/run-20260409_103808-6h1zojqq/files/post_kd_s2a_step2000.pth"   # null → kd_train_config から自動導出
  
  
 # ── Post-KD チェックポイントの保存先 ─────────────────────────────────────────
@@ -23,16 +23,16 @@ ckpt_save_path: "checkpoints/post_kd/default"
  
 # ── 実行するステージ ──────────────────────────────────────────────────────────
 stages:
-  - 1
   - 2
  
  
 # ── データセットルートパス（train_config.yaml と同じ設定を使い回す）──────────
 data_roots:
-  freiburg:   "/path/to/freiburg"     # ← 実際のパスに変更
-  tartanrgbt: "/path/to/tartanrgbt"
-  vivid:      "/path/to/vivid"
-  sthereo:    "/path/to/sthereo"
+  freiburg:   "datasets/freiburg"      # ← 実際のパスに変更してください
+  tartanrgbt: "datasets/tartanRGBT"
+  vivid:      "datasets/vivid/extracted_data"
+  sthereo:    "datasets/sthereo"
+  ms2:        "datasets/ms2"
 
 splits_roots:
   freiburg:   null
@@ -57,7 +57,7 @@ s1_lr:          0.0001
 s1_lr_step:     10000
 s1_n_steps:     30000
 s1_lambda_fine: 0.5    # fine_matching_loss の重み
-s1_n_pts:       256    # fine_matching_loss のサンプリング点数
+s1_n_pts:       1024    # fine_matching_loss のサンプリング点数
 
 
 # ── Stage 2: 幾何整合ファインチューニング ─────────────────────────────────────
@@ -69,7 +69,7 @@ s2_stride: 1   # 連続フレームの間隔
 
 # Stage 2a: バックボーン凍結維持
 s2a_lr:      0.00005
-s2a_n_steps: 10000
+s2a_n_steps: 0
 
 # Stage 2b: block4/5/fusion を極小LRで解凍
 s2b_lr:      0.00001
@@ -77,11 +77,12 @@ s2b_n_steps: 5000
 
 # 損失パラメータ
 s2_lambda_epi:    0.5    # エピポーラ損失の重み
+s2_n_pts:         256 
 s2_epi_threshold: 2.0   # Sampson距離のソフトインライア閾値（画素）
 
 
 # ── 共通訓練設定 ──────────────────────────────────────────────────────────────
-batch_size:        4
+batch_size:        256
 train_num_workers: 4
 seed:              42
 grad_clip:         1.0
@@ -94,7 +95,7 @@ device_num:        "0"
 # ── wandb ─────────────────────────────────────────────────────────────────────
 no_wandb:       false
 wandb_project:  "thermal-xfeat-post-kd"
-wandb_run_name: null          # null → "post_kd_s1_2" で自動生成
+wandb_run_name: post_kd_s1_2_nkd1024_nrelkd512_npts1024_homo15_stage2b_fix         # null → "post_kd_s1_2" で自動生成
 wandb_group:    "post_kd"
 wandb_tags:
   - freiburg

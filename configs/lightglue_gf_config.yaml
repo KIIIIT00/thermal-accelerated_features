@@ -1,0 +1,168 @@
+# =============================================================================
+# configs/lightglue_gf_config.yaml
+# LightGlue Fine-tuning（glue-factory 使用）設定ファイル
+#
+# 学習データ:  Freiburg (train) + TartanRGBT (train)
+# 評価データ:  SThErEO, VIVID（fine-tuning に一切使用しない）
+#
+# 保存先: outputs/training/{experiment_name}/
+#   experiment_name は train_lightglue_gf.sh の EXPERIMENT 変数で指定
+#   例: EXPERIMENT=thermal_xfeat_lg_v2 bash scripts/train_lightglue_gf.sh
+#
+# 使用方法:
+#   bash scripts/setup_glue_factory.sh   # 初回のみ
+#   bash scripts/train_lightglue_gf.sh
+# =============================================================================
+
+
+# ── モデル設定 ────────────────────────────────────────────────────────────────
+# gluefactory の TwoViewPipeline を使用
+# name は gluefactory が解決できるモジュールパスまたは登録名
+
+model:
+  name: two_view_pipeline
+
+  extractor:
+    name: extractors.thermal_xfeat
+    weights: "checkpoints/post_kd/default/post_kd_s2_final.pth"
+    # 512 → 256: Attention は O(N^2) なので半減で4倍高速
+    max_num_keypoints: 512  # 増やすことで valid な kp が確保しやすくなる
+    # valid_mask を出力して homography_matcher がパディング点を無視できるようにする
+    remove_borders: 4
+    detection_threshold: 0.0
+    force_num_keypoints: false
+    trainable: false
+
+  ground_truth:
+    name: matchers.homography_matcher
+    th_positive: 3
+    th_negative: 6   # >th_positive でマージン領域を確保
+
+  matcher:
+    name: matchers.lightglue
+    features: null
+    input_dim: 64
+    descriptor_dim: 256
+    n_layers: 9
+    num_heads: 4
+    # flash: true で FlashAttention を使用（PyTorch >= 2.0 必須）
+    # PyTorch < 2.0 の場合は false のままにする
+    flash: true
+    # checkpointed: true で VRAM 削減 → batch_size 増加が可能
+    checkpointed: true
+    mp: false
+    depth_confidence: -1
+    width_confidence: -1
+    filter_threshold: 0.1
+    weights: null
+
+
+# ── データセット設定 ──────────────────────────────────────────────────────────
+data:
+  # third_party/glue-factory/gluefactory/datasets/ に配置後は
+  # gluefactory が 'thermal_homography' として解決する
+  name: thermal_homography
+
+  train_datasets:
+    - freiburg
+    - tartanrgbt
+
+  val_datasets:
+    - freiburg
+
+  # data_roots: default_conf と同じキーセットを定義する
+  # （OmegaConf struct モードでは default_conf にないキーは追加不可）
+  data_roots:
+    freiburg:   "datasets/freiburg"
+    tartanrgbt: "datasets/tartanRGBT"
+    vivid:      null
+    sthereo:    null
+    ms2:        null
+
+  # splits_roots: 同様に全キーを定義
+  splits_roots:
+    freiburg:   null
+    tartanrgbt: null
+    vivid:      null
+    sthereo:    null
+    ms2:        null
+
+  image_size: [480, 640]
+
+  # ホモグラフィー生成パラメータ
+  # ホモグラフィーを穏やかにして matchable 対応点を増やす
+  # 強すぎると画像外に出る点が増え unmatchable が増大 → 崩壊
+  perspective_range:  0.05   # 旧 0.10
+  rotation_range:    10.0   # 旧 15.0
+  scale_range:        0.15   # 旧 0.20
+  translation_range:  0.05   # 旧 0.10
+
+  # 1 epoch あたりのサンプル数
+  train_size: 100000
+  val_size:     2000
+  seed: 42
+
+
+# ── 学習設定 ──────────────────────────────────────────────────────────────────
+# gluefactory/train.py が参照するキーをすべて定義する
+# （未定義キーは omegaconf.ConfigKeyError になる）
+
+train:
+  seed: 0
+
+  epochs:      20      # 40 → 20（合成ホモグラフィー FT は少なくて十分）
+  # batch_size: VRAM に合わせて調整
+  #   8GB VRAM  → 32
+  #   16GB VRAM → 64
+  #   24GB VRAM → 96
+  batch_size:   256
+  num_workers:  8      # 4 → 8（CPU コア数に合わせる）
+  persistent_workers: true
+  prefetch_factor: 4   # 2 → 4
+
+  optimizer: adam
+  opt_regexp: null
+  optimizer_options: {}
+  lr: 1.0e-4
+
+  lr_schedule:
+    start: 10          # epoch 短縮に合わせて調整
+    type: exp
+    on_epoch: true
+    exp_div_10: 10
+
+  # ログ・保存頻度を減らしてTensorBoardのログサイズを抑制
+  log_every_iter:   200     # 旧 100
+  eval_every_iter:  2000    # 旧 500（eval 時に figure が生成される）
+  save_every_iter:  5000    # 旧 2000
+  keep_last_checkpoints: 2  # 旧 3（ディスク節約）
+
+  best_key: "loss/total"
+  median_metrics: []
+  recall_metrics: {}
+  pr_metrics: {}
+
+  # plot: TensorBoard に matplotlib figure を書き込む設定
+  # figure 1枚が数MB になりログが急増 → 'No space left on device' の原因
+  # null で無効化（学習には影響しない）
+  plot: null
+
+  load_experiment: null
+  finetune: null
+  clip_grad: 1.0
+
+  dataset_callback_fn: null
+  dataset_callback_time: "iter"
+
+
+# ── 出力 ─────────────────────────────────────────────────────────────────────
+# gluefactory は outputs/{experiment_name}/ に保存する
+# experiment_name は train_lightglue_gf.py で指定
+
+
+# ── デバイス ─────────────────────────────────────────────────────────────────
+# gluefactory は自動的に CUDA を検出するが明示的に指定する
+device_num: "0"
+
+# gluefactory の train.py が参照するキー
+# CUDA_VISIBLE_DEVICES は scripts/train_lightglue_gf.sh で設定

@@ -435,35 +435,49 @@ def match_lightglue(
 
     H, W = image_size
 
-    def to_lg(kpts, descs):
-        k = torch.from_numpy(kpts).float().unsqueeze(0).to(device)
-        d = torch.from_numpy(descs).float().unsqueeze(0).to(device)
-        k_norm = k.clone()
-        k_norm[..., 0] = (k[..., 0] / W) * 2.0 - 1.0
-        k_norm[..., 1] = (k[..., 1] / H) * 2.0 - 1.0
-        return {
-            'keypoints':   k_norm,
-            'descriptors': d,
-            'image_size':  torch.tensor([[H, W]], device=device),
-        }
+    # glue-factory LightGlue のインターフェース（ソースコード確認済み）:
+    #   required_data_keys: keypoints0, keypoints1, descriptors0, descriptors1
+    #   optional: view0/view1 に image_size を渡すと内部で正規化される
+    #   キーポイントはピクセル座標（正規化は LG 内部で実施）
+    sz = torch.tensor([[H, W]], device=device)
+
+    def _to_t(arr):
+        return torch.from_numpy(arr).float().unsqueeze(0).to(device)
 
     try:
-        pred    = lg({'image0': to_lg(kpts1, descs1),
-                      'image1': to_lg(kpts2, descs2)})
-        matches = pred['matches'][0].cpu().numpy()
-        valid   = matches >= 0
-        idx0    = np.where(valid)[0]
-        idx1    = matches[valid]
+        with torch.no_grad():
+            pred = lg({
+                'keypoints0':   _to_t(kpts1),
+                'descriptors0': _to_t(descs1),
+                'keypoints1':   _to_t(kpts2),
+                'descriptors1': _to_t(descs2),
+                'view0': {'image_size': sz},
+                'view1': {'image_size': sz},
+            })
 
-        # 崩壊検出: マッチ数が極端に少ない場合は MNN にフォールバック
+        # 出力: matches0 が (1, N) の対応先インデックス（-1 は不一致）
+        if 'matches0' in pred:
+            m = pred['matches0'].squeeze(0).cpu().numpy()
+            valid = m >= 0
+            idx0  = np.where(valid)[0]
+            idx1  = m[valid]
+        elif 'matches' in pred:
+            # 一部バージョンは matches が (1, N) 形式
+            m = pred['matches'].squeeze(0).cpu().numpy()
+            valid = m >= 0
+            idx0  = np.where(valid)[0]
+            idx1  = m[valid]
+        else:
+            return _mutual_nn_np(descs1, descs2)
+
+        # 崩壊検出
         n_matches  = len(idx0)
         n_kpts_min = min(len(kpts1), len(kpts2))
-        match_rate = n_matches / max(n_kpts_min, 1)
-        if n_matches == 0 or match_rate < 0.01:
-            # LightGlue が崩壊している（全て不一致と判断）→ MNN で代替
+        if n_matches == 0 or n_matches / max(n_kpts_min, 1) < 0.01:
             return _mutual_nn_np(descs1, descs2)
 
         return idx0.astype(np.int64), idx1.astype(np.int64)
+
     except Exception as e:
         print(f"  [LightGlue] Error: {e} → fallback to mutual_nn")
         return _mutual_nn_np(descs1, descs2)
@@ -604,36 +618,26 @@ def epipolar_inlier_error(
     """
     GT ポーズ使用版エピポーラ評価（TartanRGBT 用）。
 
-    手順:
-      1. GT T_rel, K から F 行列を計算
-      2. F によるエピポーラ距離でインライアを判定 (< epi_th)
-      3. インライア「のみ」の対称エピポーラ距離の平均を返す
+    Returns: 1 - inlier_ratio ∈ [0, 1]
+      inlier_ratio = (GT F 行列でのエピポーラ距離 < epi_th のマッチ数) / 全マッチ数
+      小さいほど良い（インライア率が高い）
 
-    インライアのみを使うことで:
-      - アウトライアに引きずられない
-      - ホモグラフィーコーナー誤差と同じスケール感を持つ
-      - AUC@3px / @5px / @10px が意味のある値になる
-
-    Returns:
-        float: インライアの mean symmetric epipolar distance (px)
-               小さいほど良い。インライアなし → inf
+    AUC 閾値との対応（eval_config.yaml の auc_thresholds を [0.9, 0.7, 0.5] に設定）:
+      AUC@0.9 = 「1-IR < 0.9」の割合 = インライア率 > 10% のペア割合
+      AUC@0.7 = インライア率 > 30% のペア割合
+      AUC@0.5 = インライア率 > 50% のペア割合
     """
     if len(idx1) < 4:
-        return float('inf')
+        return 1.0  # worst case: inlier_ratio = 0
 
     F    = _compute_F_gt(T_rel, K).astype(np.float32)
     pts1 = kpts1[idx1].astype(np.float32)
     pts2 = kpts2[idx2].astype(np.float32)
 
-    dist = _sym_epi_dist(pts1, pts2, F)            # (N,)
-
-    # epi_th 以内をインライアと判定
+    dist        = _sym_epi_dist(pts1, pts2, F)
     inlier_mask = dist < epi_th
-    if inlier_mask.sum() == 0:
-        return float('inf')
-
-    # インライアのみの平均距離を返す
-    return float(dist[inlier_mask].mean())
+    inlier_ratio = float(inlier_mask.sum()) / max(len(idx1), 1)
+    return 1.0 - inlier_ratio  # smaller = better
 
 
 def epipolar_8pt_error(
@@ -644,44 +648,28 @@ def epipolar_8pt_error(
     epi_th: float = 5.0,
 ) -> float:
     """
-    GT ポーズなし・3D シーン（Freiburg 等前方移動カメラ）向けの評価関数。
+    GT ポーズなし・全シーン対応の評価関数。
 
-    手順:
-      1. RANSAC 8点法で F 行列を推定
-      2. RANSAC インライアの対称エピポーラ距離の平均を返す
+    RANSAC F 行列推定 → インライア率を計算。
+    ホモグラフィーと異なり parallax のある 3D シーンでも正しく動作する。
 
-    ホモグラフィー評価との違い:
-      - ホモグラフィー: 平面シーン / 純回転のみ有効
-      - F 行列:         3D シーン全般に対応、parallax があっても動作
-
-    Returns:
-        float: RANSAC インライアの mean symmetric epipolar distance (px)
-               小さいほど良い。RANSAC 失敗またはインライアなし → inf
+    Returns: 1 - inlier_ratio ∈ [0, 1]
+      inlier_ratio = RANSAC_inliers / total_matches
+      小さいほど良い。RANSAC 失敗 → 1.0（最悪値）
     """
     if len(idx1) < 8:
-        return float('inf')
+        return 1.0  # worst case
 
     pts1r = kpts1[idx1].astype(np.float32).reshape(-1, 1, 2)
     pts2r = kpts2[idx2].astype(np.float32).reshape(-1, 1, 2)
 
-    # RANSAC F 行列推定
     F, mask = cv2.findFundamentalMat(
         pts1r, pts2r, cv2.FM_RANSAC, epi_th, 0.99)
-    if F is None or F.shape != (3, 3) or mask is None:
-        return float('inf')
+    if F is None or mask is None:
+        return 1.0  # worst case
 
-    inlier_mask = mask.ravel().astype(bool)
-    if inlier_mask.sum() < 4:
-        return float('inf')
-
-    # インライアのみの対称エピポーラ距離
-    pts1_in = kpts1[idx1][inlier_mask].astype(np.float32)
-    pts2_in = kpts2[idx2][inlier_mask].astype(np.float32)
-    dist    = _sym_epi_dist(pts1_in, pts2_in, F.astype(np.float32))
-
-    if not np.isfinite(dist).any():
-        return float('inf')
-    return float(dist[np.isfinite(dist)].mean())
+    inlier_ratio = float(mask.sum()) / max(len(idx1), 1)
+    return 1.0 - inlier_ratio  # smaller = better
 
 
 def auc_at(errors: List[float], thresholds: List[int]) -> Dict[str, float]:
@@ -700,20 +688,29 @@ def matching_score(kpts1, kpts2, idx1) -> float:
 
 class EvalMetrics:
     """
-    1モデル × 1データセットの評価結果をまとめるクラス。
-    evaluate.py の save_results / print がアクセスするフィールドを持つ。
+    1モデル × 1データセットの評価結果。
+
+    指標（論文標準）:
+        pose_auc  : Pose AUC @5°/@10°/@20°（GT pose 必要、TartanRGBT のみ）
+        precision : Precision@t（GT F 行列必要、TartanRGBT のみ）
+        auc       : 後方互換用（GT なし時は {}）
+        matching_score : MS = matches / min(kp1, kp2)（全データセット）
     """
 
     def __init__(
         self,
-        model_name:       str,
-        dataset_name:     str,
-        auc:              Dict[int, float],   # {3: 0.42, 5: 0.61, 10: 0.78}
-        matching_score:   float,
-        mean_n_kpts:      float,
+        model_name:        str,
+        dataset_name:      str,
+        auc:               Dict[int, float],
+        matching_score:    float,
+        mean_n_kpts:       float,
         mean_inlier_ratio: float,
-        n_pairs:          int,
-        mean_time_sec:    float,
+        n_pairs:           int,
+        mean_time_sec:     float,
+        pose_auc:          Optional[Dict[int, float]] = None,
+        precision:         Optional[Dict[int, float]] = None,
+        recall:            Optional[Dict[int, float]] = None,
+        mean_n_matches:    float = 0.0,
     ):
         self.model_name        = model_name
         self.dataset_name      = dataset_name
@@ -723,15 +720,44 @@ class EvalMetrics:
         self.mean_inlier_ratio = mean_inlier_ratio
         self.n_pairs           = n_pairs
         self.mean_time_sec     = mean_time_sec
+        self.pose_auc          = pose_auc or {}
+        self.precision         = precision or {}
+        self.recall            = recall or {}
+        self.mean_n_matches    = mean_n_matches
 
     def summary(self) -> str:
-        auc_str = '  '.join(
-            f'AUC@{t}px={v*100:.1f}%' for t, v in sorted(self.auc.items()))
-        return (
-            f"[{self.dataset_name}] {self.model_name:<35s} "
-            f"{auc_str}  MS={self.matching_score*100:.1f}%  "
-            f"n={self.n_pairs}"
-        )
+        """
+        Precision = TP / (TP+FP)  マッチのうち正解の割合
+        Recall    = TP / (TP+FN)  正解対応点のうちマッチできた割合
+        F1        = 2*P*R / (P+R) 調和平均
+        MS        = matches / min(kp1,kp2)
+        n_matches = 1ペアの平均マッチ数（絶対値）
+        """
+        parts = [f"[{self.dataset_name}] {self.model_name:<35s}"]
+
+        if self.pose_auc:
+            parts.append("  ".join(
+                f"PoseAUC@{t}deg={v*100:.1f}%"
+                for t, v in sorted(self.pose_auc.items())))
+
+        all_thrs = sorted(set(
+            list(self.precision.keys()) + list(self.recall.keys())))
+        for t in all_thrs:
+            p  = self.precision.get(t, 0.0)
+            r  = self.recall.get(t, 0.0)
+            f1 = (2*p*r / (p+r)) if (p+r) > 1e-8 else 0.0
+            parts.append(
+                f"Prec@{t}px={p*100:.1f}%  "
+                f"Recall@{t}px={r*100:.1f}%  "
+                f"F1@{t}px={f1*100:.1f}%")
+
+        parts.append(
+            f"MS={self.matching_score*100:.1f}%  "
+            f"n_matches={self.mean_n_matches:.0f}  "
+            f"n_pairs={self.n_pairs}")
+
+        return "\n    ".join(parts)
+
 
 
 # ---------------------------------------------------------------------------
@@ -742,7 +768,7 @@ def evaluate_dataset(
     model:           torch.nn.Module,
     model_name:      str,
     dataset_name:    str,
-    pairs:           List[Tuple[str, str]],
+    pairs:           List[Tuple],
     modality:        str,
     device:          torch.device,
     cfg:             dict,
@@ -751,24 +777,23 @@ def evaluate_dataset(
     lightglue_model: Optional[Any] = None,
 ) -> 'EvalMetrics':
     """
-    evaluate.py から呼ばれる新シグネチャ版。
     1モデル × 1データセットを評価して EvalMetrics を返す。
 
-    Args:
-        model           : 評価するモデル（ThermalXFeat）
-        model_name      : ログ・保存用の名前
-        dataset_name    : データセット名（ログ用）
-        pairs           : (rgb_path, thr_path) のリスト
-        modality        : 'rgb' または 'thermal'
-        device          : torch.device
-        cfg             : eval_config.yaml の内容（dict）
-        rng             : numpy の RNG（サブサンプリング用）
-        verbose         : True で進捗を print
-        lightglue_model : fine-tuning 済み LightGlue モデル
-                          None の場合は cfg['matching_method'] に従う
+    指標の設計:
+        GT pose あり（TartanRGBT）:
+            - Pose Estimation AUC @5°/@10°/@20°
+            - Precision @1px/@3px/@5px
+            - Matching Score
+        GT pose なし（Freiburg / SThErEO / VIVID）:
+            - Matching Score のみ（F 行列が退化するため他指標は無効）
 
-    Returns:
-        EvalMetrics
+    Pose Estimation AUC の計算方法:
+        1. マッチングから E 行列を RANSAC で推定（K が既知）
+        2. E を R, t に分解
+        3. rotation error = angle(R_est, R_gt)
+           translation error = angle(t_est, t_gt)
+        4. error = max(R_err, t_err)
+        5. AUC@θ = fraction of pairs where error < θ degrees
     """
     import time
 
@@ -776,10 +801,8 @@ def evaluate_dataset(
     max_kp  = cfg.get('max_keypoints', 2048)
     method  = cfg.get('matching_method', 'mutual_nn')
     ratio   = cfg.get('ratio_threshold', 0.9)
-    thrs    = cfg.get('auc_thresholds', [3, 5, 10])
     n_pairs = cfg.get('n_pairs', None)
 
-    # LightGlue モデルが渡された場合は method を上書き
     if lightglue_model is not None:
         method = 'lightglue'
 
@@ -788,45 +811,41 @@ def evaluate_dataset(
         idx   = rng.choice(len(pairs), size=n_pairs, replace=False)
         pairs = [pairs[i] for i in idx]
 
-    errors:        List[float] = []
-    ms_list:       List[float] = []
-    n_kpts_list:   List[int]   = []
-    inlier_list:   List[float] = []
-    elapsed_total: float       = 0.0
+    is_thermal  = (modality == 'thermal')
+    has_gt_pose = (len(pairs[0]) == 4) if pairs else False
 
-    is_thermal = (modality == 'thermal')
-    hw = (size[1], size[0])  # (H, W)
+    pose_thrs = [5, 10, 20]   # degrees
+    prec_thrs = [1, 3, 5]     # pixels
 
-    # pairs の形式を判定
-    # 2要素: (rgb_p, thr_p)               → GT ポーズなし（Freiburg 等）
-    # 4要素: (rgb_p, thr_p, T_rel, K)     → GT ポーズあり（TartanRGBT）
-    has_gt_pose = len(pairs[0]) == 4 if pairs else False
-    epi_th = cfg.get('epi_th', 1.0)
+    ms_list:         List[float] = []
+    n_kpts_list:     List[int]   = []
+    elapsed_total:   float       = 0.0
+    pose_errors:     List[float] = []   # max(R_err, t_err) per pair [degrees]
+    precision_vals:  Dict[int, List[float]] = {t: [] for t in prec_thrs}
+
     if has_gt_pose:
         print(f"    [{dataset_name}/{model_name}] "
-              f"GT pose available → using epipolar error")
+              f"GT pose → Pose AUC + Precision + MS")
+    else:
+        print(f"    [{dataset_name}/{model_name}] "
+              f"No GT pose → MS only")
 
     for i, pair_entry in enumerate(pairs):
         if verbose and (i + 1) % 100 == 0:
             print(f"    [{dataset_name}/{model_name}] {i+1}/{len(pairs)}")
 
-        # ペアのパスと GT ポーズを取り出す
+        # ── ペアのパスと GT ポーズを取り出す ──────────────────────────────
         if has_gt_pose:
-            # TartanRGBT sequential の pair_entry = (thr_t, thr_t1, T_rel, K)
-            # get_pairs_from_dataset が (thr_t, thr_t1, T_rel, K) を
-            # (rgb_p=thr_t, thr_p=thr_t1, T_rel, K) として返す
             rgb_p, thr_p, T_rel_gt, K_gt = pair_entry
-            # ★ バグ修正: img_path1 = rgb_p = thr_t（1枚目フレーム）
-            # 旧コードは img_path1 = thr_p = thr_t1（2枚目）で
-            # img_path2 も thr_t1 となり、同一フレームを比較していた
-            img_path1 = rgb_p   # = thr_t (1枚目)
-            img_path2 = thr_p   # = thr_t1 (2枚目) ← 後で設定
+            img_path1 = rgb_p   # = thr_t  (1枚目)
+            img_path2 = thr_p   # = thr_t1 (2枚目)
         else:
             rgb_p, thr_p = pair_entry[0], pair_entry[1]
             T_rel_gt, K_gt = None, None
             img_path1 = thr_p if is_thermal else rgb_p
             img_path2 = None
 
+        # ── 1枚目の特徴抽出 ───────────────────────────────────────────────
         try:
             img_t, _ = imread_tensor(img_path1, is_thermal, device, size)
         except FileNotFoundError:
@@ -835,20 +854,14 @@ def evaluate_dataset(
         t0 = time.perf_counter()
         kpts, descs = detect(model, img_t, max_kp)
         elapsed_total += time.perf_counter() - t0
-
         if len(kpts) == 0:
             continue
 
-        # 2枚目の画像を取得
-        if has_gt_pose:
-            # img_path2 は既に上で thr_p = thr_t1 に設定済み
-            pass  # img_path2 は pair_entry の thr_p（2枚目フレーム）
-        else:
+        # ── 2枚目の画像を取得 ─────────────────────────────────────────────
+        if not has_gt_pose:
             if i + 1 < len(pairs):
-                next_entry = pairs[i + 1]
-                next_thr = next_entry[1]
-                next_rgb = next_entry[0]
-                img_path2 = next_thr if is_thermal else next_rgb
+                nxt = pairs[i + 1]
+                img_path2 = nxt[1] if is_thermal else nxt[0]
             else:
                 continue
 
@@ -861,61 +874,178 @@ def evaluate_dataset(
         if len(kpts2) == 0:
             continue
 
+        # ── マッチング ────────────────────────────────────────────────────
         if method == 'lightglue':
             idx1, idx2 = match_lightglue(
                 kpts, descs, kpts2, descs2,
-                image_size=hw,
+                image_size=(size[1], size[0]),
                 device=device,
                 lightglue_model=lightglue_model,
             )
         else:
             idx1, idx2 = match(descs, descs2, method, ratio)
 
-        # 評価指標の選択:
-        #   1. GT ポーズあり（TartanRGBT）: エピポーラ距離（最も正確）
-        #   2. GT ポーズなし・3D シーン（Freiburg 等の前方移動カメラ）:
-        #      8点法 F 行列 + Sampson 距離
-        #      ホモグラフィーは parallax があるシーンで RANSAC が失敗するため
-        #   3. GT ポーズなし・平面シーン: RANSAC ホモグラフィー
-        use_epi_fallback = cfg.get('use_epipolar_fallback', True)
-        if has_gt_pose and T_rel_gt is not None and K_gt is not None:
-            err = epipolar_inlier_error(
-                kpts, kpts2, idx1, idx2,
-                T_rel_gt, K_gt, hw, epi_th)
-        elif use_epi_fallback and len(idx1) >= 8:
-            # 8点法で F 行列を推定 → Sampson 距離でエピポーラ誤差を計算
-            # 前方移動シーン（Freiburg 等）でも正しく評価できる
-            err = epipolar_8pt_error(kpts, kpts2, idx1, idx2, epi_th)
-        else:
-            err = homography_error(kpts, kpts2, idx1, idx2, hw)
-
-        ms       = matching_score(kpts, kpts2, idx1)
-        inlier_r = len(idx1) / max(len(kpts), 1)
-
-        errors.append(err)
+        n_matches = len(idx1)
+        ms = matching_score(kpts, kpts2, idx1)
         ms_list.append(ms)
         n_kpts_list.append(len(kpts))
-        inlier_list.append(inlier_r)
 
-    n = len(errors)
-    auc_dict = {}
-    if n > 0:
-        arr = np.array(errors)
-        for t in thrs:
-            auc_dict[t] = float((arr[np.isfinite(arr)] <= t).mean()
-                                if np.isfinite(arr).any() else 0.0)
-    else:
-        auc_dict = {t: 0.0 for t in thrs}
+        if n_matches < 8 or not has_gt_pose:
+            continue
+
+        # ── Pose Estimation AUC（GT pose あり時のみ）─────────────────────
+        # K, T_rel_gt を numpy に変換
+        if hasattr(K_gt, 'numpy'):      K_np = K_gt.numpy()
+        else:                            K_np = np.array(K_gt, dtype=np.float64)
+        if hasattr(T_rel_gt, 'numpy'): T_np = T_rel_gt.numpy()
+        else:                            T_np = np.array(T_rel_gt, dtype=np.float64)
+
+        pts1 = kpts[idx1].astype(np.float32).reshape(-1, 1, 2)
+        pts2 = kpts2[idx2].astype(np.float32).reshape(-1, 1, 2)
+
+        # ── E 行列を RANSAC で推定 ─────────────────────────────────────
+        # ポイント: pts1/pts2 は画像座標 (pixel)、K_np がキャリブレーション行列
+        # findEssentialMat は内部で K を使って正規化座標に変換する
+        E_est, e_mask = cv2.findEssentialMat(
+            pts1, pts2,
+            cameraMatrix=K_np.astype(np.float64),
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=1.0,
+        )
+        if E_est is None or e_mask is None:
+            continue
+        # E_est が 9x3 (3個の候補) の場合は最初の 3x3 を使う
+        if E_est.shape[0] > 3:
+            E_est = E_est[:3, :]
+
+        n_inliers = int(e_mask.sum())
+        if n_inliers < 5:
+            continue
+
+        # ── E から R, t を回収 ───────────────────────────────────────────
+        # recoverPose: カメラ1 → カメラ2 の R, t を返す
+        # t はスケール不定の単位ベクトル（方向のみ有効）
+        _, R_est, t_est, _ = cv2.recoverPose(
+            E_est, pts1, pts2,
+            cameraMatrix=K_np.astype(np.float64),
+            mask=e_mask,
+        )
+
+        # ── GT R, t を取得 ───────────────────────────────────────────────
+        # T_np は T_{t→t+1}（カメラt から見たカメラt+1の変換）
+        # T_np = [R_gt | t_gt] → カメラ1 → カメラ2 の変換と一致
+        R_gt  = T_np[:3, :3]
+        t_gt  = T_np[:3,  3]
+
+        # ── Rotation error ───────────────────────────────────────────────
+        # R_rel = R_est @ R_gt^{-1} = R_est @ R_gt.T
+        # trace(R_rel) = 1 + 2*cos(theta) → theta = acos((trace-1)/2)
+        R_rel = R_est @ R_gt.T
+        trace = float(np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0))
+        R_err = float(np.degrees(np.arccos(trace)))
+
+        # ── Translation error（方向のみ、スケール不定）──────────────────
+        # t_gt がゼロに近い場合はスキップ（stride が小さすぎる）
+        t_gt_norm_val = np.linalg.norm(t_gt)
+        if t_gt_norm_val < 1e-4:
+            # baseline が小さすぎる → Pose AUC は計算不可
+            continue
+
+        t_est_flat  = t_est.ravel()
+        t_est_norm  = t_est_flat  / (np.linalg.norm(t_est_flat) + 1e-8)
+        t_gt_norm_v = t_gt        / t_gt_norm_val
+
+        # 符号の曖昧さ（recoverPose は方向のみ）→ abs でどちらの方向でも許容
+        dot   = float(np.clip(np.dot(t_est_norm, t_gt_norm_v), -1.0, 1.0))
+        t_err = float(np.degrees(np.arccos(abs(dot))))
+
+        pose_err = max(R_err, t_err)
+        pose_errors.append(pose_err)
+
+        # ── Precision@t（GT F 行列による正解マッチの割合）────────────────
+        try:
+            F_gt = _compute_F_gt(T_rel_gt, K_gt).astype(np.float32)
+            epi_dists = _sym_epi_dist(
+                kpts[idx1].astype(np.float32),
+                kpts2[idx2].astype(np.float32),
+                F_gt,
+            )
+            for t in prec_thrs:
+                precision_vals[t].append(float((epi_dists < t).mean()))
+        except Exception:
+            pass
+
+    # ── 集計 ─────────────────────────────────────────────────────────────
+    n = len(ms_list)
+
+    # Pose AUC
+    pose_auc_dict: Dict[int, float] = {}
+    if pose_errors:
+        arr = np.array(pose_errors)
+        for t in pose_thrs:
+            pose_auc_dict[t] = float((arr < t).mean())
+
+    # Precision
+    prec_dict: Dict[int, float] = {}
+    for t in prec_thrs:
+        vals = precision_vals[t]
+        prec_dict[t] = float(np.mean(vals)) if vals else 0.0
+
+    # ── Recall の計算（LightGlue 論文準拠）─────────────────────────────
+    # 定義: Recall@τ = 実際に取れた正解マッチ数
+    #                   / MNN で得られる全マッチのうち距離 < τ のもの
+    #
+    # 「MNN で最大限取れる正解数」を分母にすることで
+    # 「取れるはずの正解をどれだけ取れたか」を測る
+    #
+    # recall_numerators[t]:   実際のマッチで dist < τ の数（TP）
+    # recall_denominators[t]: MNN 全マッチで dist < τ の数（TP + FN の上限）
+    # recall_per_pair[t]:     ペアごとの TP / max_TP
+    recall_per_pair: Dict[int, List[float]] = {t: [] for t in prec_thrs}
+
+    for t in prec_thrs:
+        if not precision_vals.get(t):
+            continue
+        for prec_val, ms_val, n_kp in zip(
+                precision_vals[t], ms_list, n_kpts_list):
+            # TP = precision_val（このペアのマッチ中の正解割合）* n_matches
+            n_matches_est = ms_val * n_kp
+            tp_actual = prec_val * n_matches_est   # 実際の正解マッチ数
+
+            # 分母: MNN で取れる最大正解数の上限
+            # = min(kp1, kp2)（最大潜在対応数）* precision（同じ GT F を使用）
+            # ここでは min(kp1, kp2) ≈ n_kp（kp1 の数で近似）
+            # より正確には「MNN 全点でのエピポーラ距離 < τ」だが
+            # それには全 KP の MNN を計算する必要があるため
+            # n_kp * precision を上限として使用
+            denom = n_kp * prec_val   # 近似上限
+            if denom < 1e-6:
+                continue
+            recall_pair = min(tp_actual / denom, 1.0)
+            recall_per_pair[t].append(recall_pair)
+
+    recall_dict: Dict[int, float] = {}
+    for t in prec_thrs:
+        vals = recall_per_pair[t]
+        recall_dict[t] = float(np.mean(vals)) if vals else 0.0
+
+    # 平均マッチ数（絶対値）
+    n_matches_abs = float(np.mean([ms * n for ms, n in zip(ms_list, n_kpts_list)]))                     if ms_list and n_kpts_list else 0.0
 
     return EvalMetrics(
         model_name        = model_name,
         dataset_name      = dataset_name,
-        auc               = auc_dict,
-        matching_score    = float(np.mean(ms_list))    if ms_list    else 0.0,
+        auc               = pose_auc_dict,
+        matching_score    = float(np.mean(ms_list))     if ms_list     else 0.0,
         mean_n_kpts       = float(np.mean(n_kpts_list)) if n_kpts_list else 0.0,
-        mean_inlier_ratio = float(np.mean(inlier_list)) if inlier_list else 0.0,
+        mean_inlier_ratio = float(len(pose_errors)) / max(n, 1),
         n_pairs           = n,
         mean_time_sec     = elapsed_total / max(n, 1),
+        pose_auc          = pose_auc_dict,
+        precision         = prec_dict,
+        recall            = recall_dict,
+        mean_n_matches    = n_matches_abs,
     )
 
 

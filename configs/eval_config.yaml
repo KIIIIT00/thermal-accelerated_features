@@ -1,125 +1,122 @@
 # =============================================================================
-# configs/eval_config.yaml
-# キーポイント・マッチング精度評価の設定ファイル
+# configs/pipeline_config.yaml
+# ThermalXFeat 堅牢モデルの全学習パイプライン設定
 #
-# 使用方法:
-#   python evaluate.py --config configs/eval_config.yaml
-#   python evaluate.py --config configs/eval_config.yaml --n_pairs 100
+# 根拠（実験結果）:
+#   - kd_only が最良（rep/geo 損失は有害、-22.4pt）
+#   - kaist_morning 単独 PoseAUC=93% vs 全val=54% → 汎化不足
+#   - VIVID PoseAUC=37.5% → degenerate configuration（KP 集中）
+#   - Recall 135.9% → 65.7% → 記述子ドリフト（XFeat+LG 分離問題）
 # =============================================================================
 
+# ── データ設定 ───────────────────────────────────────────────────────────────
+data:
+  sthereo_root:  "datasets/sthereo"
+  vivid_root:    "datasets/vivid"
+  split:         "all"              # 全シーケンスで学習（汎化のため）
+  max_pairs_per_seq: 2000
+  eval_n_pairs:  200                # 評価ペア数
+  stride:        3                  # SThErEO: 連続フレーム間隔
+  vivid_stride:  2                  # VIVID: stride=5 は移動が大きすぎるため縮小
 
-# ── evaluate.py 用モデルリスト ────────────────────────────────────────────────
-# 比較したいモデルをここに列挙する。
-# weights に null を指定するとランダム重み（デバッグ用）。
-models:
-  - name: "xfeat_thermal_baseline"
-    weights: "weights/xfeat.pt"
-    modality: "thermal"
-    description: "XFeat(RGB weights) on thermal [KD前ベースライン]"
+# ── 共通学習設定 ─────────────────────────────────────────────────────────────
+training:
+  device:    "0"
+  seed:      42
+  image_size: [640, 480]
+  max_keypoints: 1024
 
-  - name: "thermal_xfeat_proposed"
-    weights: "checkpoints/post_kd/default/post_kd_s2_final.pth"
-    modality: "thermal"
-    description: "ThermalFeat KD+Stage1+Stage2 [提案手法]"
+# ── Stage 1: KD 事前学習 ─────────────────────────────────────────────────────
+# 実験結果: kd_only が最良。rep/geo 損失は廃止。
+# SThErEO 全9 + VIVID 19 シーケンスで多環境汎化を達成する。
+stage1:
+  name:        "kd_pretrain"
+  output:      "checkpoints/pipeline/stage1_kd"
+  epochs:      100
+  batch_size:  16                   # 旧 batch=4 では 2.6% しか更新されなかった
+  lr:          1.0e-4
+  lr_scheduler: "cosine"
+  eval_interval: 10
+  best_metric:  "PoseAUC@5"         # PoseAUC で best.pth を保存
 
+  losses:
+    lambda_kd:       1.0            # 特徴マップ KD（確定有効）
+    lambda_relational: 0.1          # Relational KD（intra-modal 構造転移）
+    lambda_fpn:      0.05           # FPN ノイズ不変性（熱画像物理考慮）
+    lambda_spatial:  0.0            # Stage1 では使わない（まず基本を安定化）
+    lambda_thermal:  0.0
 
-# ── evaluate/eval_matching.py 用（単体実行時のモデル設定）─────────────────────
-student_weights: "checkpoints/post_kd/default/post_kd_s2_final.pth"
-teacher_weights: "weights/xfeat.pt"
+  augmentation:
+    brightness_jitter: 0.2          # 輝度変動（時間帯変化に対応）
+    contrast_jitter:   0.2          # コントラスト変動
+    gaussian_noise:    0.02         # ガウスノイズ
+    fpn_sigma_min:     2.0          # FPN 列ノイズ最小強度 [DN]
+    fpn_sigma_max:     8.0          # FPN 列ノイズ最大強度 [DN]
 
+  weights_init: "checkpoints/post_kd/default/post_kd_s2_final.pth"
+  # ↑ proposed(init) から開始（実験で有効と確認）
 
-# ── データセットルートパス ───────────────────────────────────────────────────
-data_roots:
-  freiburg:   "datasets/freiburg"
-  tartanrgbt: "datasets/tartanRGBT"
-  vivid:      "datasets/vivid/extracted_data"
-  sthereo:    "datasets/sthereo"
-  ms2:        "datasets/ms2"
+# ── Stage 2: 空間分散損失を追加 ──────────────────────────────────────────────
+# 目的: degenerate configuration の防止（VIVID PoseAUC 37.5%→改善）
+# VIVID 実験で genuine=365 あっても PoseAUC=37.5% → KP が進行方向に集中
+stage2:
+  name:        "spatial_diversity"
+  output:      "checkpoints/pipeline/stage2_spatial"
+  epochs:      50
+  batch_size:  16
+  lr:          5.0e-5               # Stage1 より低い lr（fine-tune）
+  lr_scheduler: "cosine"
+  eval_interval: 10
+  best_metric:  "PoseAUC@5"
 
-splits_roots:
-  freiburg:   null
-  tartanrgbt: null
-  vivid:      null
-  sthereo:    null
-  ms2:        null
+  losses:
+    lambda_kd:       1.0
+    lambda_relational: 0.1
+    lambda_fpn:      0.05
+    lambda_spatial:  0.1            # NEW: KP 空間分散（4×4 grid entropy）
+    lambda_thermal:  0.05           # NEW: 温度勾配領域への KP 誘導
 
+  weights_init: "checkpoints/pipeline/stage1_kd/best.pth"
 
-# ── 評価対象データセット ─────────────────────────────────────────────────────
-# evaluate.py が参照するキー
-# 優先度: SThErEO・VIVID（評価専用・fine-tuning 未使用）を必ず含める
-eval_dataset:
-  - freiburg    # GT ポーズなし → RANSAC 評価
-  - tartanrgbt  # GT ポーズあり → エピポーラ距離評価（最も正確）
-  - sthereo     # GT ポーズなし → RANSAC 評価（評価専用・汎化の指標）
-  - vivid       # GT ポーズなし → RANSAC 評価（評価専用・汎化の指標）
+# ── Stage 3: LightGlue 再 fine-tune ─────────────────────────────────────────
+# 目的: Stage2 で変化した記述子空間に LG を再適応
+# Stage2 後: Recall が 65.7% 程度に低下する可能性
+# → LG を 20 epoch 再 fine-tune して Recall を回復
+stage3:
+  name:        "lg_readapt"
+  output:      "checkpoints/pipeline/stage3_lg"
+  epochs:      20
+  lr:          1.0e-4
+  xfeat_weights: "checkpoints/pipeline/stage2_spatial/best.pth"
+  # glue-factory の train_lightglue_gf.py を使用
 
-# evaluate/eval_matching.py 単体実行時が参照するキー
-datasets:
-  - freiburg
+# ── Stage 4: XFeat + LG 同時 fine-tune ──────────────────────────────────────
+# 目的: 記述子ドリフトの根本解決
+# 根拠: Recall 135.9% は XFeat と LG が同一空間にある時のみ達成可能
+stage4:
+  name:        "joint_finetune"
+  output:      "checkpoints/pipeline/stage4_joint"
+  epochs:      10
+  batch_size:  8
+  lr:          1.0e-5               # 非常に低い lr（壊さないよう）
+  lambda_kd:   1.0
+  lambda_match: 0.5                 # LG マッチング損失の重み
+  best_metric: "Recall@3px"         # Recall を主指標に
 
-split: "val"
+  xfeat_weights: "checkpoints/pipeline/stage2_spatial/best.pth"
+  lg_weights:    "checkpoints/pipeline/stage3_lg/best.tar"
 
+# ── 最終評価設定 ──────────────────────────────────────────────────────────────
+evaluation:
+  # 主結果（論文記載）
+  primary:
+    seq:         "kaist_morning"
+    n_pairs:     500
+    seed:        42
+    eval_all:    true
 
-# ── 評価ペア数 ────────────────────────────────────────────────────────────────
-# null → 全件（freiburg は 4329 件で時間がかかるため最初は 200 程度を推奨）
-# evaluate.py が参照するキー
-n_pairs: 200
-
-# evaluate/eval_matching.py 単体実行時が参照するキー
-n_eval_pairs: 200
-
-
-# ── Homography Estimation 設定 ───────────────────────────────────────────────
-auc_thresholds: [3, 5, 10]
-
-# マッチング手法: "mutual_nn" | "lightglue"
-# LightGlue を使う場合は lightglue_weights も設定する
-matching_method: "lightglue"
-
-# glue-factory が保存する形式: outputs/training/{experiment}/checkpoint_best.tar
-# MNN で評価する場合は以下を null にするか matching_method を mutual_nn に変更
-lightglue_weights: "third_party/glue-factory/outputs/training/thermal_xfeat_lg_v3/checkpoint_best.tar"
-
-ratio_threshold: 0.9
-max_keypoints: 2048
-
-# エピポーラ評価の設定
-# use_epipolar_fallback: True → GT ポーズなし時も 8点法 F 行列で評価
-#   Freiburg 等の前方移動シーンでホモグラフィー失敗（AUC=0%）を防ぐ
-use_epipolar_fallback: true
-epi_th: 5.0    # エピポーラ線への距離閾値（画素単位）インライア判定に使用
-
-# TartanRGBT の評価 stride（1=連続フレーム=trivial, 5〜10 を推奨）
-tartanrgbt_eval_stride: 5
-
-
-# ── 出力設定 ─────────────────────────────────────────────────────────────────
-output_dir: "evaluate/results"
-save_metrics_json: true
-save_metrics_csv: true
-save_figures: true
-save_match_images: true
-n_vis_samples: 5          # マッチング可視化の枚数
-
-
-# ── 可視化設定（eval_matching.py 単体実行用） ────────────────────────────────
-n_viz: 5
-viz_models:
-  - teacher_rgb
-  - teacher_thr
-  - student_thr
-
-kp_radius: 3
-kp_color_teacher_rgb: [0, 255, 0]
-kp_color_teacher_thr: [0, 0, 255]
-kp_color_student_thr: [255, 128, 0]
-match_color: [255, 255, 0]
-
-viz_width: 640
-viz_height: 480
-
-
-# ── システム ─────────────────────────────────────────────────────────────────
-device_num: "0"
-num_workers: 2
-seed: 42
+  # 補助評価（汎化確認）
+  secondary:
+    datasets: ["sthereo", "vivid"]
+    n_pairs:  200
+    matching: "lightglue"

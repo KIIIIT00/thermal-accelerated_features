@@ -115,13 +115,12 @@ def get_pairs_from_dataset(
     データセット名からペアリストを取得する。
 
     返り値の形式:
-      Freiburg / SThErEO / VIVID : [(rgb_path, thr_path), ...]
-      TartanRGBT                 : [(rgb_path, thr_path, T_rel, K), ...]
-                                    ← GT ポーズ付き（エピポーラ評価に使用）
+      GT なし (Freiburg)  : [(rgb_path, thr_path), ...]
+      GT あり (TartanRGBT/SThErEO/VIVID):
+                            [(path_t, path_t1, T_rel_ndarray, K_ndarray), ...]
     """
     from modules.dataset.thermal.loader import (
-        _resolve_data_root,
-        _resolve_splits_dir,
+        _resolve_data_root, _resolve_splits_dir,
     )
     from modules.dataset.thermal.freiburg   import FreiburgDataset
     from modules.dataset.thermal.tartanrgbt import TartanRGBTDataset
@@ -144,46 +143,76 @@ def get_pairs_from_dataset(
     data_root  = _resolve_data_root(name_l, args)
     splits_dir = _resolve_splits_dir(name_l, args)
 
-    # TartanRGBT は GT ポーズ付きの Sequential 版を使う
+    # eval_stride を設定から読み込む（全 Sequential データセットで共通）
+    try:
+        import yaml as _yaml
+        _cfg = _yaml.safe_load(open(args.config)) or {}
+        eval_stride = _cfg.get('eval_stride', 5)
+    except Exception:
+        eval_stride = 5
+
+    # ── TartanRGBT: GT ポーズ付き Sequential ──────────────────────────────
     if name_l == 'tartanrgbt':
         try:
             from modules.dataset.thermal.sequential import TartanRGBTSequentialDataset
-            # stride=1 は連続フレームで運動量が極小 → trivial（全マッチが閾値内）
-            # stride=5 以上で非 trivial な評価ペアを生成する
-            eval_stride = getattr(args, 'tartanrgbt_eval_stride', None) or                           cfg.get('tartanrgbt_eval_stride', 5)                           if hasattr(args, 'cfg') else 5
-            # args から cfg にアクセスできない場合のフォールバック
-            try:
-                import yaml as _yaml
-                _cfg = _yaml.safe_load(open(args.config)) or {}
-                eval_stride = _cfg.get('tartanrgbt_eval_stride', 5)
-            except Exception:
-                eval_stride = 5
-
+            # splits_dir が未設定の場合は AnyThermal の公式パスを使う
+            tartan_splits = splits_dir or os.path.join(
+                'third_party', 'anythermal',
+                'custom_datasets', 'tartanRGBT', 'splits')
             ds = TartanRGBTSequentialDataset(
                 data_root  = data_root,
-                splits_dir = splits_dir,
+                splits_dir = tartan_splits,
                 stride     = eval_stride,
             )
-            print(f"[Eval] tartanrgbt: using stride={eval_stride}")
-            pairs = list(ds._pairs)
-            # sequential の _pairs は (thr_t, thr_t1, T_rel, K) 形式
-            # evaluate.py は (rgb, thr, T_rel, K) を期待するため変換
-            # TartanRGBT は RGB パスが別ディレクトリにあるため thr を rgb 代わりに使う
             pairs_out = []
-            for p in pairs:
+            for p in ds._pairs:
+                # (thr_t, thr_t1, T_rel, K) → rgb_p=thr_t, thr_p=thr_t1
                 if len(p) == 4:
-                    thr_t, thr_t1, T_rel, K = p
-                    # rgb_path = thr_path（モダリティは thermal で評価）
-                    pairs_out.append((thr_t, thr_t1, T_rel, K))
+                    pairs_out.append(p)
                 else:
                     pairs_out.append(p)
-            print(f"[Eval] tartanrgbt: {len(pairs_out)} val pairs loaded"
-                  f" (with GT pose) | data={data_root}")
-            return pairs_out
+            if pairs_out:
+                print(f"[Eval] tartanrgbt: {len(pairs_out)} pairs "
+                      f"(GT pose, stride={eval_stride})")
+                return pairs_out
         except Exception as e:
-            print(f"[Eval] tartanrgbt: Sequential failed ({e}), "
-                  f"falling back to standard pairs")
+            print(f"[Eval] tartanrgbt Sequential failed ({e}) → fallback")
 
+    # ── SThErEO: GT ポーズ付き Sequential ────────────────────────────────
+    if name_l == 'sthereo':
+        try:
+            from modules.dataset.thermal.sequential import SThErEOSequentialDataset
+            ds = SThErEOSequentialDataset(
+                data_root = data_root,
+                stride    = eval_stride,
+                split     = 'val',
+            )
+            if ds._pairs:
+                print(f"[Eval] sthereo: {len(ds._pairs)} pairs "
+                      f"(GT pose, stride={eval_stride})")
+                return list(ds._pairs)
+            print("[Eval] sthereo: Sequential empty → standard fallback")
+        except Exception as e:
+            print(f"[Eval] sthereo Sequential failed ({e}) → fallback")
+
+    # ── VIVID: GT ポーズ付き Sequential ──────────────────────────────────
+    if name_l == 'vivid':
+        try:
+            from modules.dataset.thermal.sequential import VividSequentialDataset
+            ds = VividSequentialDataset(
+                data_root = data_root,
+                stride    = eval_stride,
+                split     = 'all',  # val シーケンス名が 'campus' でない場合は all を使用
+            )
+            if ds._pairs:
+                print(f"[Eval] vivid: {len(ds._pairs)} pairs "
+                      f"(GT pose, stride={eval_stride})")
+                return list(ds._pairs)
+            print("[Eval] vivid: Sequential empty → standard fallback")
+        except Exception as e:
+            print(f"[Eval] vivid Sequential failed ({e}) → fallback")
+
+    # ── 通常版（GT なし）───────────────────────────────────────────────────
     ds = _CLS[name_l](
         data_root=data_root,
         splits_dir=splits_dir,
@@ -191,8 +220,7 @@ def get_pairs_from_dataset(
         augment=False,
     )
     pairs = list(ds._pairs)
-    print(f"[Eval] {name}: {len(pairs)} val pairs loaded"
-          f" | data={data_root}")
+    print(f"[Eval] {name}: {len(pairs)} val pairs (no GT pose) | data={data_root}")
     return pairs
 
 
@@ -339,7 +367,7 @@ def main() -> None:
     for m_cfg in models_cfg:
         model = load_model(m_cfg.get('weights'), device)
         models[m_cfg['name']] = model
-        print(f"  {m_cfg['name']:35s} modality={m_cfg['modality']}"
+        print(f"  {m_cfg['name']:35s} modality={m_cfg.get('modality', 'thermal')}"
               f"  desc={m_cfg.get('description','')}")
 
     # ── LightGlue のロード ─────────────────────────────────────────────────
@@ -379,7 +407,7 @@ def main() -> None:
 
         for m_cfg in models_cfg:
             model_name = m_cfg['name']
-            modality   = m_cfg['modality']
+            modality   = m_cfg.get('modality', 'thermal')
             model      = models[model_name]
 
             print(f"\n  -- {model_name} ({modality}) --")

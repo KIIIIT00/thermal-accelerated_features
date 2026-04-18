@@ -1,0 +1,81 @@
+# =============================================================================
+# configs/overfit_config.yaml
+# 過学習実験設定 ─ 問題の切り分け用
+#
+# 目的:
+#   1シーケンス(kaist_morning)のみで500エポック学習し，
+#   同じシーケンスで評価することで「モデルが学習できるか」を確認する．
+#
+# 判断基準:
+#   [A] 過学習後 MS ≥ baseline(50%) かつ PoseAUC ≥ baseline(66%)
+#       → モデル容量は十分．汎化のためデータを増やせばよい
+#
+#   [B] 過学習後も MS < baseline(50%)
+#       → 損失設計に問題がある．KD が Repeatability を破壊している
+#
+#   [C] 過学習後 PoseAUC ↑ だが MS は低いまま
+#       → 幾何精度は学習できるが KP 選択が問題
+#       → 温度勾配 KP 選択の追加で解決できる可能性がある
+# =============================================================================
+
+# ── 過学習対象シーケンス ──────────────────────────────────────────────────
+overfit_sequence: "kaist_morning"   # SThErEO の 1 シーケンスのみ
+overfit_mode: true                  # これが true のとき train/val を同じシーケンスから取る
+
+# ── データ設定 ───────────────────────────────────────────────────────────
+data_roots:
+  sthereo: "datasets/sthereo"
+
+# ペア生成: kaist_morning の最初の 500 ペアのみ
+max_pairs_overfit: 500   # 少ないデータで確実に過学習させる
+image_size: [640, 480]
+max_keypoints: 1024
+
+# ── 学習設定 ─────────────────────────────────────────────────────────────
+epochs: 500              # 通常の 10 倍（確実に過学習させる）
+batch_size: 4
+learning_rate: 1.0e-4
+lr_scheduler: "cosine"
+
+# ── 損失設計（段階的 ablation 用）───────────────────────────────────────
+# 以下を順番に切り替えて実行する（ablation 実験）
+loss_config:
+  # [実験A] KD 損失のみ
+  use_kd_loss: true
+  use_repeatability_loss: false
+  use_geometry_loss: false
+
+  # [実験B] repeatability 損失のみ
+  # use_kd_loss: false
+  # use_repeatability_loss: true
+  # use_geometry_loss: false
+
+  # [実験C] 幾何整合損失のみ
+  # use_kd_loss: false
+  # use_repeatability_loss: false
+  # use_geometry_loss: true
+
+  # [実験D] 全部（現在の設定）
+  # use_kd_loss: true
+  # use_repeatability_loss: true
+  # use_geometry_loss: true
+
+# 損失の重み
+lambda_kd:           1.0
+lambda_repeatability: 1.0
+lambda_geometry:     0.5
+
+# ── 評価設定 ─────────────────────────────────────────────────────────────
+# 過学習実験では train データ = val データ（同一シーケンス）
+eval_on_train_data: true
+eval_interval: 50    # 50 epoch ごとに評価
+n_pairs_eval: 100    # 評価ペア数
+
+# ── チェックポイント ──────────────────────────────────────────────────────
+output_dir: "checkpoints/overfit_experiment"
+save_interval: 100
+
+# ── 可視化 ───────────────────────────────────────────────────────────────
+visualize_matches: true
+vis_interval: 100    # 100 epoch ごとにマッチング可視化
+vis_n_pairs: 5       # 可視化するペア数

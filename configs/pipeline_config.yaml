@@ -1,0 +1,116 @@
+# =============================================================================
+# configs/pipeline_config.yaml
+# ThermalXFeat 堅牢モデルの全学習パイプライン設定
+#
+# 実験根拠:
+#   - kd_only が最良（rep/geo 損失は PoseAUC -22.4pt の劣化）
+#   - proposed(init) = post_kd_s2_final.pth が最良の出発点
+#   - 全データ: SThErEO 15,662 + VIVID 12,454 = 28,016 ペア
+#   - best_metric: PoseAUC@5（論文主結果と統一、SLAM 性能を直接測定）
+#   - Recall@3px は LG の挙動に依存し不安定 → best 選択基準に不適
+# =============================================================================
+
+# ── データ設定 ───────────────────────────────────────────────────────────────
+data:
+  sthereo_root:      "datasets/sthereo"
+  vivid_root:        "datasets/vivid"
+  ms2_root:          "datasets/ms2"   # MS2 追加（雨天・夜間・天候多様性）
+  split:             "all"
+  max_pairs_per_seq: 2000
+  eval_n_pairs:      200           # 統計的信頼性: SE=sqrt(p(1-p)/200)≈3.5pt
+  stride:            3             # SThErEO フレーム間隔
+  vivid_stride:      2             # VIVID: stride=5 は視点変化が大きすぎる
+  ms2_stride:        3             # MS2: 連続フレーム（subsample=10 済み）
+
+# ── Stage 1: KD 事前学習 ─────────────────────────────────────────────────────
+# 目的: RGB→熱 記述子空間の転移（多環境汎化）
+# 根拠: kd_only が最良（rep/geo 損失は PoseAUC -22.4pt の劣化）
+stage1:
+  name:        "kd_pretrain"
+  output:      "checkpoints/pipeline/stage1_kd_ms2"
+  epochs:      100
+  batch_size:  32                   # GPU 余裕あり（旧 16 から増加）
+  lr:          1.0e-4
+  lr_scheduler: "cosine"
+  eval_interval: 5                  # 5 epoch ごとに評価（early stopping 検出）
+  best_metric:  "sthereo_PoseAUC@5" # 論文主結果と同一指標
+
+  losses:
+    lambda_kd:        1.0           # 特徴マップ KD（確定有効）
+    lambda_relational: 0.1          # Relational KD（intra-modal 構造転移）
+    lambda_fpn:       0.05          # FPN ノイズ不変性（熱画像物理考慮）
+
+  weights_init: "checkpoints/post_kd/default/post_kd_ms2_s2_final.pth"
+  # ↑ 実験で最良と確認した proposed(init) から開始
+  # RGB 初期値からの学習との比較:
+  #   proposed(init) → Prec@3px=57.9%（初期値時点で baseline 超え）
+  #   RGB 初期値    → Prec@3px=40.0%（初期値時点で baseline 以下）
+
+# ── Stage 2: 空間分散損失を追加 ──────────────────────────────────────────────
+# 目的: degenerate configuration の防止
+# 根拠: VIVID で genuine=365 あっても PoseAUC=37.5%（KP が進行方向に集中）
+#       E行列5点法には画像全体への KP 分散が必須
+stage2:
+  name:        "spatial_diversity"
+  output:      "checkpoints/pipeline/stage2_spatial_ms2"
+  epochs:      50
+  batch_size:  32                   # GPU 余裕あり
+  lr:          5.0e-5               # Stage1 の 1/2（過学習防止）
+  lr_scheduler: "cosine"
+  eval_interval: 5
+  best_metric:  "sthereo_PoseAUC@5" # Stage1 と同一（改善の連続性を確認）
+
+  losses:
+    lambda_kd:        1.0
+    lambda_relational: 0.1
+    lambda_fpn:       0.05
+    lambda_spatial:   0.1           # NEW: KP 空間分散（4×4 grid entropy）
+    lambda_thermal:   0.05          # NEW: 温度境界への KP 誘導
+
+  weights_init: "checkpoints/pipeline/stage1_kd_ms2/best.pth"
+
+# ── Stage 3: LightGlue 再 fine-tune ─────────────────────────────────────────
+# 目的: Stage2 の記述子変化に LG を再適応（Recall の回復）
+# 根拠: XFeat 更新後 Recall 135.9%→65.7% に低下（記述子ドリフト）
+# データ: SThErEO のみ（VIVID の GT 精度が LOAM のため LG 学習には不適）
+stage3:
+  name:        "lg_readapt"
+  output:      "checkpoints/pipeline/stage3_lg_ms2"
+  epochs:      20
+  lr:          1.0e-4
+  xfeat_weights: "checkpoints/pipeline/stage2_spatial_ms2/best.pth"
+
+# ── Stage 4: XFeat + LG 同時 fine-tune ──────────────────────────────────────
+# 目的: 記述子ドリフトの根本解決（分離最適化の問題を解消）
+# 根拠: proposed(init) で Recall=135.9% は XFeat+LG が整合していた証拠
+# best_metric: PoseAUC@5（Recall@3px は不安定 → 採用しない）
+# 理由: Recall は LG の挙動に依存（>100%になるケースもある）
+#       PoseAUC は SLAM 性能を直接測定する最終目標指標
+stage4:
+  name:        "joint_finetune"
+  output:      "checkpoints/pipeline/stage4_joint_ms2"
+  epochs:      10
+  batch_size:  16                   # 同時 backward でメモリ増加のため抑制
+  lr:          1.0e-5               # 非常に低い lr（壊さないよう）
+  lambda_kd:   1.0
+  lambda_match: 0.5
+  best_metric:  "sthereo_PoseAUC@5" # PoseAUC@5（Recall@3px は不採用）
+
+  xfeat_weights: "checkpoints/pipeline/stage2_spatial_ms2/best.pth"
+  lg_weights:    "checkpoints/pipeline/stage3_lg_ms2/best.tar"
+
+# ── 最終評価 ──────────────────────────────────────────────────────────────────
+evaluation:
+  # 主結果（論文記載・再現性確認済み）
+  primary:
+    seq:       "kaist_morning"
+    n_pairs:   500
+    seed:      42
+    eval_all:  true
+    target:    93.0                 # 目標 PoseAUC@5（%）
+
+  # 汎化確認（補助評価）
+  secondary:
+    sthereo_n_pairs: 200
+    vivid_n_pairs:   200
+    matching:        "lightglue"

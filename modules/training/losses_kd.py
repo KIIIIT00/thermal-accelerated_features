@@ -392,3 +392,122 @@ def fpn_invariance_loss_fast(
         loss: scalar Tensor
     """
     return F.mse_loss(feats_fpn, feats_clean.detach())
+
+
+# ---------------------------------------------------------------------------
+# NEW: L_spatial: KP 空間分布エントロピー損失
+# ---------------------------------------------------------------------------
+
+def spatial_entropy_loss(
+    kpts:    torch.Tensor,
+    scores:  torch.Tensor,
+    img_hw:  tuple,
+    n_grid:  int = 4,
+) -> torch.Tensor:
+    """
+    キーポイントの空間分布を均一化する損失。
+
+    【根拠】
+    VIVID 実験で genuine=365 あっても PoseAUC=37.5% という事実は、
+    KP が進行方向前方に集中していることを示す。
+    E行列の5点法には画像全体への分散が必須（degenerate configuration の回避）。
+
+    実装:
+        画像を n_grid × n_grid セルに分割し、
+        各セルの KP スコア密度のエントロピーを最大化する。
+        エントロピーが最大 = 均等分布 = loss=0
+
+    Args:
+        kpts:   (N, 2) キーポイント座標 [x, y] in [0, W/H]
+        scores: (N,)   検出スコア（重みとして使用）
+        img_hw: (H, W) 画像サイズ
+        n_grid: グリッド分割数（4×4=16 セル）
+
+    Returns:
+        loss: scalar Tensor（0=均等分布, 1=完全集中）
+    """
+    H, W = img_hw
+    if len(kpts) == 0:
+        return kpts.new_zeros(1).squeeze()
+
+    # 各 KP がどのセルに属するかを計算
+    cell_i = (kpts[:, 1] / H * n_grid).long().clamp(0, n_grid - 1)
+    cell_j = (kpts[:, 0] / W * n_grid).long().clamp(0, n_grid - 1)
+    cell_idx = cell_i * n_grid + cell_j   # (N,) 0〜n_grid^2-1
+
+    # スコア加重セル密度
+    n_cells = n_grid * n_grid
+    density = kpts.new_zeros(n_cells)
+    density.scatter_add_(0, cell_idx, scores)
+    density = density / (density.sum() + 1e-8)   # 確率分布に正規化
+
+    # エントロピー計算（最大化 = loss を最小化）
+    log_density = torch.log(density + 1e-8)
+    entropy     = -(density * log_density).sum()
+    max_entropy = torch.log(torch.tensor(float(n_cells), device=kpts.device))
+
+    # エントロピーを [0,1] に正規化し、均等分布のとき loss=0
+    return 1.0 - entropy / (max_entropy + 1e-8)
+
+
+# ---------------------------------------------------------------------------
+# NEW: L_thermal: 温度勾配領域への KP 誘導損失
+# ---------------------------------------------------------------------------
+
+def thermal_gradient_loss(
+    kpts:    torch.Tensor,
+    scores:  torch.Tensor,
+    img_thr: torch.Tensor,
+) -> torch.Tensor:
+    """
+    温度勾配が大きい領域（物体輪郭・温度境界）に KP を誘導する損失。
+
+    【根拠】
+    熱画像の均一領域（路面・空）の KP は時間的に不安定で Repeatability が低い。
+    温度境界は物体の物理的な縁であり時間的に安定した特徴点が存在する。
+    現在の XFeat hmap は RGB パターンを学習したもので熱画像に不適切。
+
+    実装:
+        Sobel フィルタで温度勾配マップを計算し、
+        KP 位置での勾配値が低いほど損失が大きくなる。
+        つまり「勾配が大きい領域の KP を高スコアにする」よう学習。
+
+    Args:
+        kpts:    (N, 2) キーポイント座標 [x, y] in pixel
+        scores:  (N,)   検出スコア（learn_able な量）
+        img_thr: (1, 3, H, W) 熱画像テンソル [0, 1]
+
+    Returns:
+        loss: scalar Tensor（勾配大の KP が高スコアのとき小さくなる）
+    """
+    if len(kpts) == 0 or img_thr is None:
+        return kpts.new_zeros(1).squeeze()
+
+    B, C, H, W = img_thr.shape
+
+    # グレースケール化 → Sobel 勾配
+    with torch.no_grad():
+        gray = img_thr.mean(dim=1, keepdim=True)   # (B, 1, H, W)
+        sobel_x = torch.tensor(
+            [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+            device=img_thr.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
+            device=img_thr.device).view(1, 1, 3, 3)
+        gx = F.conv2d(gray, sobel_x, padding=1)
+        gy = F.conv2d(gray, sobel_y, padding=1)
+        grad_mag = (gx ** 2 + gy ** 2).sqrt().squeeze()   # (H, W)
+        # [0, 1] 正規化
+        grad_mag = grad_mag / (grad_mag.max() + 1e-8)
+
+    # KP 位置での勾配値をバイリニア補間でサンプリング
+    kx = kpts[:, 0].clamp(0, W - 1).long()
+    ky = kpts[:, 1].clamp(0, H - 1).long()
+    grad_at_kpts = grad_mag[ky, kx]   # (N,)
+
+    # スコア加重: 勾配が大きい KP に高スコアがつくよう学習
+    # 目標: scores が高いほど grad_at_kpts も高いこと
+    # = 1 - Σ(scores_normalized × grad_at_kpts) を最小化
+    scores_norm = scores / (scores.sum() + 1e-8)
+    expected_grad = (scores_norm * grad_at_kpts).sum()
+    return 1.0 - expected_grad

@@ -27,6 +27,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from modules.training.losses_kd import spatial_entropy_loss, thermal_gradient_loss
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -87,6 +89,20 @@ def get_args():
                    help='SThErEO フレーム間隔')
     p.add_argument('--vivid_stride',      type=int, default=2,
                    help='VIVID フレーム間隔（stride=5 は移動が大きすぎる）')
+    
+    # 初期評価の有無
+    p.add_argument('--skip_initial_eval', action='store_true', default=False)
+
+    # データ拡張
+    p.add_argument('--p_flip',        type=float, default=0.5)
+    p.add_argument('--p_brightness',  type=float, default=0.5)
+    p.add_argument('--p_contrast',    type=float, default=0.5)
+    p.add_argument('--p_fpn',         type=float, default=0.4)
+    p.add_argument('--p_vignetting',  type=float, default=0.3)
+    p.add_argument('--p_motion_blur', type=float, default=0.2)
+    p.add_argument('--p_gaussian',    type=float, default=0.3)
+    p.add_argument('--p_rain',        type=float, default=0.15)
+    p.add_argument('--p_clahe_rand',  type=float, default=0.4)
 
     # 評価設定
     p.add_argument('--n_eval_pairs',      type=int, default=200,
@@ -101,6 +117,10 @@ def get_args():
     p.add_argument('--weights_init',      default=None)
     p.add_argument('--device',            default='0')
     p.add_argument('--seed',              type=int, default=42)
+
+    # 損失関数
+    p.add_argument('--lambda_spatial', type=float, default=0.0)
+    p.add_argument('--lambda_thermal', type=float, default=0.0)
 
     # best.pth の選択基準
     p.add_argument('--best_metric',       default='sthereo_PoseAUC@5',
@@ -445,16 +465,28 @@ def main():
         param.requires_grad_(False)
 
     student = XFeatModel().to(device).train()
-    if args.weights_init and os.path.isfile(args.weights_init):
-        state = torch.load(args.weights_init, map_location=device, weights_only=True)
-        student.load_state_dict(state)
-        print(f"[Student] init from: {args.weights_init}")
+    if args.weights_init:
+        # パスが渡されている場合は常に表示する
+        if os.path.isfile(args.weights_init):
+            state = torch.load(args.weights_init, map_location=device, weights_only=True)
+            student.load_state_dict(state)
+            print(f"[Student] Loaded weights from: {args.weights_init}")
+        else:
+            # ファイルが見つからない場合は警告を出す
+            print(f"[WARNING] Weight file not found: {args.weights_init}")
+            print("[Student] Falling back to default initial weights")
     else:
-        print("[Student] init from default RGB weights")
+        print("[Student] No weights specified: using default initial weights")
+
+    print("[Student] モデルをコンパイルしています (torch.compile)...")
+    # student = torch.compile(student)
 
     optimizer = torch.optim.Adam(student.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs)
+
+    # 初期評価変数の初期化
+    init_s, init_v = None, None
 
     # ── ベースライン評価 ───────────────────────────────────────────────
     baseline = XFeatModel().to(device).eval()
@@ -467,14 +499,17 @@ def main():
                                    args.n_eval_pairs, 'vivid')
         print_metrics("RGB XFeat", base_v, 'vivid')
 
-    print("\n[Student 初期評価]")
-    init_s = evaluate_dataset(student, sthereo_eval, device,
+    if not args.skip_initial_eval:
+        print("\n[Student 初期評価]")
+        init_s = evaluate_dataset(student, sthereo_eval, device,
                                args.n_eval_pairs, 'sthereo')
-    print_metrics("proposed(init)", init_s, 'sthereo')
-    if vivid_eval:
-        init_v = evaluate_dataset(student, vivid_eval, device,
-                                   args.n_eval_pairs, 'vivid')
-        print_metrics("proposed(init)", init_v, 'vivid')
+        print_metrics("proposed(init)", init_s, 'sthereo')
+        if vivid_eval:
+            init_v = evaluate_dataset(student, vivid_eval, device,
+                                    args.n_eval_pairs, 'vivid')
+            print_metrics("proposed(init)", init_v, 'vivid')
+    else:
+        print("\n[Student 初期評価] skipped")
 
     # ── CSV ログ ───────────────────────────────────────────────────────
     header = ("epoch,loss,"
@@ -503,14 +538,16 @@ def main():
         f.write(header + '\n')
         f.write(fmt_row('baseline', '-', base_s,
                         base_v if vivid_eval else None) + '\n')
-        f.write(fmt_row('init', '-', init_s,
-                        init_v if vivid_eval else None) + '\n')
+        if init_s is not None:
+            f.write(fmt_row('init', '-', init_s,
+                            init_v if vivid_eval else None) + '\n')
 
     # ── DataLoader の構築 ──────────────────────────────────────────────
     # 1 epoch = 全学習ペアを1周する（通常の定義）
     # steps_per_epoch = len(train_pairs) // batch_size
 
     from torch.utils.data import Dataset as TorchDataset, DataLoader
+    from modules.training.thermal_augmentation import ThermalAugmentation
 
     class PairDataset(TorchDataset):
         """学習ペアを DataLoader で扱うための Dataset ラッパー。"""
@@ -522,22 +559,40 @@ def main():
             path_t, path_t1, *_ = self.pairs[idx]
             return path_t  # 画像パスのみ返す（load_img でロード）
 
+    custom_augmentation = ThermalAugmentation(
+        p_flip        = getattr(args, 'p_flip', 0.5),
+        p_brightness  = getattr(args, 'p_brightness', 0.5),
+        p_contrast    = getattr(args, 'p_contrast', 0.5),
+        p_fpn         = getattr(args, 'p_fpn', 0.4),
+        p_vignetting  = getattr(args, 'p_vignetting', 0.3),
+        p_motion_blur = getattr(args, 'p_motion_blur', 0.2),
+        p_gaussian    = getattr(args, 'p_gaussian', 0.3),
+        p_rain        = getattr(args, 'p_rain', 0.15),
+        p_clahe_rand  = getattr(args, 'p_clahe_rand', 0.4)
+    )
+
     def collate_fn(paths):
         """
         画像パスリスト → (clean_batch, aug_batch) のタプル。
         clean: teacher 用（拡張なし）
         aug:   student 用（データ拡張あり）
         """
-        from modules.training.thermal_augmentation import DEFAULT_AUGMENTATION
         cleans, augs = [], []
         for p in paths:
             t = load_img(p, (640, 480))
             if t is None:
                 continue
             cleans.append(t)
-            # student 用: 同じ画像に拡張を適用
-            aug = DEFAULT_AUGMENTATION(t.squeeze(0)).unsqueeze(0)
+            
+            # 2. 学生モデル用（aug）の画像生成
+            # config で拡張が有効化されている場合のみカスタム設定を適用する
+            if getattr(args, 'aug_enabled', True):
+                # DEFAULT_AUGMENTATION ではなく、上記で生成したインスタンスを使用
+                aug = custom_augmentation(t.squeeze(0)).unsqueeze(0)
+            else:
+                aug = t.clone()
             augs.append(aug)
+
         if not cleans:
             return None
         return torch.cat(cleans, dim=0), torch.cat(augs, dim=0)
@@ -563,34 +618,90 @@ def main():
     best_val = 0.0
     global_step = 0
 
+    epoch_losses = []
+    epoch_kd_losses = []
+    epoch_spatial_losses = []
+    epoch_thermal_losses = []
+
+    print("\n[学習開始] 最初のバッチの処理には数分かかる場合があります (torch.compile)...")
     for epoch in range(1, args.epochs + 1):
         student.train()
-        epoch_losses = []
+        # print(f"\n[DEBUG] Starting Epoch {epoch}")
+        epoch_losses.clear()
+        epoch_kd_losses.clear()
+        epoch_spatial_losses.clear()
+        epoch_thermal_losses.clear()
 
-        for batch in train_loader:
+        for i, batch in enumerate(train_loader):
+            # print(f"[DEBUG] Batch {i} loading...")
             if batch is None:
+                # print(f"[DEBUG] Batch {i} is None, skipping...")
                 continue
+
             imgs_clean, imgs_aug = batch
             imgs_clean = imgs_clean.to(device)
             imgs_aug   = imgs_aug.to(device)
-
+            
+            # print(f"[DEBUG] Model forward start...")
             with torch.no_grad():
                 t_out = teacher(imgs_clean)  # 教師: clean（拡張なし）
             s_out = student(imgs_aug)        # 学生: 拡張画像
-            loss  = kd_loss(s_out, t_out)
+            # print(f"[DEBUG] Model forward end.")
+            s_feats, s_kpts, s_hmap = s_out
+
+            # 知識蒸留損失
+            l_kd  = kd_loss(s_out, t_out)
+            current_loss = l_kd
+
+            # 空間分散損失
+            l_spatial_val = 0.0
+            if args.lambda_spatial > 0:
+                l_spatial = torch.stack([
+                spatial_entropy_loss(s_kpts[b].T, s_hmap[b].flatten(), (480, 640)) 
+                for b in range(args.batch_size)
+                ]).mean()
+                current_loss = current_loss + args.lambda_spatial * l_spatial
+                l_spatial_val = l_spatial.item()
+
+            # 温度勾配誘導損失
+            l_thermal_val = 0.0
+            if args.lambda_thermal > 0:
+                l_thermal = torch.stack([
+                thermal_gradient_loss(s_kpts[b].T, s_hmap[b].flatten(), imgs_aug[b:b+1]) 
+                for b in range(args.batch_size)
+                ]).mean()
+                current_loss = current_loss + args.lambda_thermal * l_thermal
+                l_thermal_val = l_thermal.item()
 
             optimizer.zero_grad()
-            loss.backward()
+            current_loss.backward()
             torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
             optimizer.step()
 
-            epoch_losses.append(float(loss.detach()))
+            epoch_losses.append(current_loss.item())
+            epoch_kd_losses.append(l_kd.item())
+            epoch_spatial_losses.append(l_spatial_val)
+            epoch_thermal_losses.append(l_thermal_val)
             global_step += 1
+            
+            if i % 10 == 0:
+                print(f"  Step [{i:3d}/{steps_per_epoch}] "
+                      f"Loss: {current_loss.item():.4f} "
+                      f"(KD: {l_kd.item():.4f}, SP: {l_spatial_val:.4f})", 
+                      end='\r', flush=True)
 
         scheduler.step()
 
         if epoch % args.eval_interval == 0 or epoch == args.epochs:
             avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+
+            log_dict = {
+                'epoch': epoch,
+                'train/loss_total':   avg_loss,
+                'train/loss_kd':      np.mean(epoch_kd_losses),
+                'train/loss_spatial': np.mean(epoch_spatial_losses),
+                'train/loss_thermal': np.mean(epoch_thermal_losses),
+            }
 
             # SThErEO 評価
             m_s = evaluate_dataset(student, sthereo_eval, device,
@@ -606,7 +717,7 @@ def main():
                 m_ms2v = evaluate_dataset(student, ms2_val_pairs, device,
                                            args.n_eval_pairs, 'ms2_val')
 
-            print(f"\n  Epoch {epoch:4d}/{args.epochs}  loss={avg_loss:.5f}")
+            print(f"\n  Epoch {epoch:4d}/{args.epochs}  loss={avg_loss:.5f}", flush=True)
             print_metrics("proposed", m_s, 'sthereo')
             if m_v:
                 print_metrics("proposed", m_v, 'vivid')
@@ -619,7 +730,7 @@ def main():
                                 m_s, m_v) + '\n')
 
             # wandb ログ
-            log_dict = {'epoch': epoch, 'train/loss': avg_loss}
+            # log_dict = {'epoch': epoch, 'train/loss': avg_loss}
             log_dict.update({f'sthereo/{k.replace("sthereo_","")}': v
                              for k, v in m_s.items()})
             if m_v:

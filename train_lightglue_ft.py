@@ -148,13 +148,15 @@ def build_loader(args: Any) -> DataLoader:
     from modules.dataset.thermal.sequential import (
         TartanRGBTSequentialDataset,
         FreiburgSequentialDataset,
+        SThErEOSequentialDataset
     )
 
     _CLS = {
         'freiburg':   FreiburgSequentialDataset,
         'tartanrgbt': TartanRGBTSequentialDataset,
+        'sthereo': SThErEOSequentialDataset
     }
-    ft_datasets = getattr(args, 'ft_datasets', ['freiburg', 'tartanrgbt'])
+    ft_datasets = getattr(args, 'ft_datasets', ['freiburg', 'tartanrgbt', 'sthereo'])
     data_roots  = getattr(args, 'data_roots', {}) or {}
     stride      = getattr(args, 'stride', 1)
 
@@ -172,11 +174,24 @@ def build_loader(args: Any) -> DataLoader:
             continue
 
         splits_dir = _get_splits_dir(name_l, args)
-        ds = _CLS[name_l](
-            data_root  = root,
-            splits_dir = splits_dir,
-            stride     = stride,
-        )
+        if name_l == 'sthereo':
+            # SThErEO は splits_dir を受け取らないため除外する
+            ds = _CLS[name_l](
+                data_root = root,
+                stride    = stride,
+            )
+        else:
+            # 他のデータセット（Freiburg, TartanRGBT）は従来通り
+            ds = _CLS[name_l](
+                data_root  = root,
+                splits_dir = splits_dir,
+                stride     = stride,
+            )
+        # ds = _CLS[name_l](
+        #     data_root  = root,
+        #     splits_dir = splits_dir,
+        #     stride     = stride,
+        # )
         datasets.append(ds)
         print(f"[LG-FT] {name}: {len(ds)} pairs")
 

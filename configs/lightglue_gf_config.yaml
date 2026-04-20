@@ -119,6 +119,7 @@ train:
   num_workers:  8      # 4 → 8（CPU コア数に合わせる）
   persistent_workers: true
   prefetch_factor: 4   # 2 → 4
+  clip_grad: 1.0
 
   optimizer: adam
   opt_regexp: null

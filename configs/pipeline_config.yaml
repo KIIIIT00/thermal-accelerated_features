@@ -21,6 +21,21 @@ data:
   stride:            3             # SThErEO フレーム間隔
   vivid_stride:      2             # VIVID: stride=5 は視点変化が大きすぎる
   ms2_stride:        3             # MS2: 連続フレーム（subsample=10 済み）
+  skip_initial_eval: true          # 初回評価をスキップ
+
+augmentation:
+  enabled:       false
+  p_flip:        0.5             # 水平反転
+  p_brightness:  0.5             # 輝度シフト
+  p_contrast:    0.5             # コントラスト変動
+  p_fpn:         0.4             # FPN 列ノイズ
+  p_vignetting:  0.3             # 周辺減光
+  p_motion_blur: 0.2             # モーションブラー
+  p_gaussian:    0.3             # ガウスノイズ
+  p_rain:        0.15            # 擬似雨滴
+  p_clahe_rand:  0.4             # CLAHE 強度ランダム化
+
+
 
 # ── Stage 1: KD 事前学習 ─────────────────────────────────────────────────────
 # 目的: RGB→熱 記述子空間の転移（多環境汎化）
@@ -37,8 +52,8 @@ stage1:
 
   losses:
     lambda_kd:        1.0           # 特徴マップ KD（確定有効）
-    lambda_relational: 0.1          # Relational KD（intra-modal 構造転移）
-    lambda_fpn:       0.05          # FPN ノイズ不変性（熱画像物理考慮）
+    lambda_relational: 0.1         # Relational KD（intra-modal 構造転移） # 0.1
+    lambda_fpn:       0.05          # FPN ノイズ不変性（熱画像物理考慮） # 0.05
 
   weights_init: "checkpoints/post_kd/default/post_kd_ms2_s2_final.pth"
   # ↑ 実験で最良と確認した proposed(init) から開始
@@ -63,7 +78,6 @@ stage2:
   losses:
     lambda_kd:        1.0
     lambda_relational: 0.1
-    lambda_fpn:       0.05
     lambda_spatial:   0.1           # NEW: KP 空間分散（4×4 grid entropy）
     lambda_thermal:   0.05          # NEW: 温度境界への KP 誘導
 
@@ -76,9 +90,10 @@ stage2:
 stage3:
   name:        "lg_readapt"
   output:      "checkpoints/pipeline/stage3_lg_ms2"
-  epochs:      20
-  lr:          1.0e-4
-  xfeat_weights: "checkpoints/pipeline/stage2_spatial_ms2/best.pth"
+  n_steps:     26000    # 10 epoch 相当（SThErEO 2619 steps/ep × 10）
+  epochs:      40       # fallback（n_steps が優先）
+  lr:          1.0e-5   # 論文 Appendix C.4: fine-tuning lr=1e-5
+  # xfeat_weights: "checkpoints/pipeline/stage2_spatial_ms2/best.pth"
 
 # ── Stage 4: XFeat + LG 同時 fine-tune ──────────────────────────────────────
 # 目的: 記述子ドリフトの根本解決（分離最適化の問題を解消）

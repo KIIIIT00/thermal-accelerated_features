@@ -1,0 +1,100 @@
+data:
+  data_roots:
+    freiburg: datasets/freiburg
+    ms2: null
+    sthereo: null
+    tartanrgbt: datasets/tartanRGBT
+    vivid: null
+  image_size:
+  - 480
+  - 640
+  name: thermal_homography
+  perspective_range: 0.05
+  rotation_range: 10.0
+  scale_range: 0.15
+  seed: 42
+  splits_roots:
+    freiburg: null
+    ms2: null
+    sthereo: null
+    tartanrgbt: null
+    vivid: null
+  train_datasets:
+  - freiburg
+  - tartanrgbt
+  train_size: 100000
+  translation_range: 0.05
+  val_datasets:
+  - freiburg
+  val_size: 2000
+device_num: '0'
+lr: 0.0001
+model:
+  extractor:
+    detection_threshold: 0.0
+    force_num_keypoints: false
+    max_num_keypoints: 512
+    name: extractors.thermal_xfeat
+    remove_borders: 4
+    trainable: false
+    weights: checkpoints/post_kd/default/post_kd_s2_final.pth
+  ground_truth:
+    name: matchers.homography_matcher
+    th_negative: 6
+    th_positive: 3
+  matcher:
+    checkpointed: true
+    depth_confidence: -1
+    descriptor_dim: 256
+    features: null
+    filter_threshold: 0.1
+    flash: true
+    input_dim: 64
+    mp: false
+    n_layers: 9
+    name: matchers.lightglue
+    num_heads: 4
+    weights: null
+    width_confidence: -1
+  name: two_view_pipeline
+n_epochs: 20
+no_wandb: false
+output_dir: checkpoints/pipeline/stage3_lg_ms2
+sthereo_root: datasets/sthereo
+train:
+  batch_size: 256
+  best_key: loss/total
+  clip_grad: 1.0
+  dataset_callback_fn: null
+  dataset_callback_time: iter
+  epochs: 20
+  eval_every_iter: 2000
+  finetune: null
+  keep_last_checkpoints: 2
+  load_experiment: null
+  log_every_iter: 200
+  lr: 0.0001
+  lr_schedule:
+    exp_div_10: 10
+    on_epoch: true
+    start: 10
+    type: exp
+  median_metrics: []
+  num_workers: 8
+  opt_regexp: null
+  optimizer: adam
+  optimizer_options: {}
+  persistent_workers: true
+  plot: null
+  pr_metrics: {}
+  prefetch_factor: 4
+  recall_metrics: {}
+  save_every_iter: 5000
+  seed: 0
+wandb_group: pipeline
+wandb_project: thermal-xfeat-kd
+wandb_run_name: stage3_lg_readapt
+wandb_tags:
+- stage3
+- lightglue
+xfeat_weights: checkpoints/pipeline/stage2_spatial_ms2/best.pth

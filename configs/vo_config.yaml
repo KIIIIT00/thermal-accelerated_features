@@ -1,0 +1,53 @@
+# =============================================================================
+# configs/vo_config.yaml
+# Visual Odometry 評価設定
+#
+# 使用方法:
+#   python evaluate_vo.py --config configs/vo_config.yaml
+#   python evaluate_vo.py --config configs/vo_config.yaml \
+#       --dataset sthereo --n_seqs 2 --n_frames 200
+# =============================================================================
+
+# ── データセット ─────────────────────────────────────────────────────────────
+eval_dataset:
+  - sthereo
+  - vivid
+
+data_roots:
+  sthereo: "datasets/sthereo"
+  vivid:   "datasets/vivid"
+
+split:    "val"    # 'val' | 'train' | 'all'
+n_frames: 300      # シーケンスあたりのフレーム数上限（多いほど精度が上がる）
+n_seqs:   null     # シーケンス数上限（null = 全シーケンス）
+
+
+# ── 比較するモデル ────────────────────────────────────────────────────────────
+models:
+  - name:    "xfeat_baseline"
+    weights: "weights/xfeat.pt"
+
+  - name:    "thermal_xfeat_proposed"
+    weights: "checkpoints/post_kd/default/post_kd_s2_final.pth"
+
+
+# ── マッチング設定 ────────────────────────────────────────────────────────────
+# 'mnn' | 'lightglue'
+matching_method: "lightglue"
+
+# LightGlue を使う場合
+lightglue_weights: "third_party/glue-factory/outputs/training/thermal_xfeat_lg_v3/checkpoint_best.tar"
+
+
+# ── VO パイプライン設定 ───────────────────────────────────────────────────────
+max_keypoints: 512
+image_size:    [640, 480]    # [W, H]
+min_inliers:   15            # E 行列 RANSAC の最小インライア数
+
+
+# ── 出力 ─────────────────────────────────────────────────────────────────────
+output_dir: "evaluate/vo_results"
+
+
+# ── システム ─────────────────────────────────────────────────────────────────
+device_num: "0"

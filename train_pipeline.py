@@ -211,46 +211,120 @@ def stage2_spatial(cfg: Dict, args: argparse.Namespace) -> int:
 
 
 def stage3_lg(cfg: Dict, args: argparse.Namespace) -> int:
-    """Stage 3: LightGlue 再 fine-tune（Stage2 後の記述子に LG を再適応）。"""
+    """Stage 3: LightGlue 再 fine-tune（Stage2 後の記述子に LG を再適応）。
+
+    使用スクリプト: train_lightglue_ft.py
+    データセット: SThErEO（連続フレーム + GT pose）
+      理由: Freiburg/TartanRGBT は GT pose なし → PoseAUC 評価不可
+            SThErEO は GPS/IMU GT（高精度）で連続フレームマッチングを学習可能
+    損失: NegativeLogAssignment（LG 公式損失）
+    XFeat: Stage2/best.pth で固定（frozen）
+    """
     s  = cfg.get('stage3', {})
     s2 = cfg.get('stage2', {})
     data = cfg.get('data', {})
+    init_type = getattr(args, 'init_type', 'proposed')
+    suffix = f'_{init_type}'
 
-    stage2_output   = s2.get('output', 'checkpoints/pipeline/stage2_spatial')
-    xfeat_weights   = s.get('xfeat_weights',
-                             os.path.join(stage2_output, 'best.pth'))
+    stage2_output = s2.get('output', 'checkpoints/pipeline/stage2_spatial') + suffix
+    xfeat_weights = s.get('xfeat_weights',
+                          os.path.join(stage2_output, 'best.pth'))
+    output        = s.get('output', 'checkpoints/pipeline/stage3_lg') + suffix
 
-    lg_cfg_path = 'configs/lightglue_gf_config.yaml'
+    sthereo_root = resolve(cfg, 'sthereo_root', args.sthereo_root,
+                           data.get('sthereo_root', 'datasets/sthereo'))
 
-    # lightglue_gf_config.yaml を動的に上書きするために一時的に書き込む
-    import copy
-    try:
-        lg_cfg = load_cfg(lg_cfg_path)
-    except Exception:
-        lg_cfg = {}
+    # lightglue_ft_config_stage3.yaml を生成
+    lg_cfg = {
+        'thermal_weights': xfeat_weights,
+        'ckpt_save_path':  output,
+        'n_steps':         s.get('n_steps', 13000),  # 5 epoch 相当（2619 steps/epoch × 5）
+        'batch_size':      s.get('batch_size', 4),
+        'lr':              s.get('lr', 1e-4),
+        'max_keypoints':   512,
+        'stride':          data.get('stride', 3),
+        # データセット: SThErEO のみ（GPS/IMU GT・高精度）
+        'ft_datasets':     ['sthereo'],
+        'data_roots': {
+            'sthereo': sthereo_root,
+        },
+        # wandb
+        'no_wandb':       args.no_wandb,
+        'wandb_project':  'thermal-xfeat-kd',
+        'wandb_run_name': f'stage3_lg_{init_type}',
+    }
 
-    lg_cfg['xfeat_weights']  = xfeat_weights
-    lg_cfg['output_dir']     = s.get('output', 'checkpoints/pipeline/stage3_lg')
-    lg_cfg['n_epochs']       = s.get('epochs', 20)
-    lg_cfg['lr']             = s.get('lr', 1e-4)
-    lg_cfg['no_wandb']       = args.no_wandb
-    lg_cfg['wandb_project']  = 'thermal-xfeat-kd'
-    lg_cfg['wandb_group']    = 'pipeline'
-    lg_cfg['wandb_run_name'] = 'stage3_lg_readapt'
-    lg_cfg['wandb_tags']     = ['stage3', 'lightglue']
-    lg_cfg['sthereo_root']   = resolve(cfg, 'sthereo_root', args.sthereo_root,
-                                       data.get('sthereo_root', 'datasets/sthereo'))
-
-    tmp_cfg = 'configs/lightglue_gf_config_stage3.yaml'
+    tmp_cfg = f'configs/lightglue_ft_config_stage3{suffix}.yaml'
     with open(tmp_cfg, 'w') as f:
         yaml.dump(lg_cfg, f, allow_unicode=True)
 
     cmd = [
-        sys.executable, 'train_lightglue_gf.py',
-        '--config', tmp_cfg,
+        sys.executable, 'train_lightglue_ft.py',
+        '--config',     tmp_cfg,
         '--device_num', args.device,
     ]
-    return run(cmd, "Stage 3: LightGlue 再 fine-tune（記述子空間への再適応）")
+    return run(cmd, f"Stage 3: LightGlue 再 fine-tune（SThErEO, init={init_type}）")
+
+
+
+def stage4_joint(cfg: Dict, args: argparse.Namespace) -> int:
+    """Stage 4: XFeat + LightGlue 同時 fine-tune（記述子ドリフトの根本解決）。
+
+    根拠:
+        実験で XFeat 単独更新後に Recall 135.9% → 65.7% に低下（記述子ドリフト）。
+        XFeat と LG を同一 backward path で同時更新することで
+        記述子変化に LG が追従し Recall の回復が期待できる。
+
+    設定:
+        lr=1e-5（非常に低い lr で壊さない）
+        XFeat: 学習可能（Stage2 の best.pth から開始）
+        LG:    学習可能（Stage3 の best.pth から開始）
+        損失:  L = L_kd(XFeat) + λ_match × L_match(LG, GT)
+    """
+    s  = cfg.get('stage4', {})
+    s2 = cfg.get('stage2', {})
+    s3 = cfg.get('stage3', {})
+    data = cfg.get('data', {})
+    init_type = getattr(args, 'init_type', 'proposed')
+    suffix = f'_{init_type}'
+
+    stage2_output  = s2.get('output', 'checkpoints/pipeline/stage2_spatial') + suffix
+    stage3_output  = s3.get('output', 'checkpoints/pipeline/stage3_lg') + suffix
+    xfeat_weights  = os.path.join(stage2_output, 'best.pth')
+    lg_weights     = os.path.join(stage3_output, 'lightglue_gf_final.pth')
+    output         = s.get('output', 'checkpoints/pipeline/stage4_joint') + suffix
+
+    sthereo_root = resolve(cfg, 'sthereo_root', args.sthereo_root,
+                           data.get('sthereo_root', 'datasets/sthereo'))
+
+    # stage4_joint_config.yaml を生成
+    joint_cfg = {
+        'xfeat_weights':  xfeat_weights,
+        'lg_weights':     lg_weights,
+        'ckpt_save_path': output,
+        'n_steps':        s.get('n_steps', 5000),
+        'batch_size':     s.get('batch_size', 16),
+        'lr':             s.get('lr', 1e-5),
+        'lambda_match':   s.get('lambda_match', 0.5),
+        'max_keypoints':  512,
+        'stride':         data.get('stride', 3),
+        'ft_datasets':    ['sthereo'],
+        'data_roots': {'sthereo': sthereo_root},
+        'no_wandb':       args.no_wandb,
+        'wandb_project':  'thermal-xfeat-kd',
+        'wandb_run_name': f'stage4_joint_{init_type}',
+    }
+
+    tmp_cfg = f'configs/joint_config_stage4{suffix}.yaml'
+    with open(tmp_cfg, 'w') as f:
+        yaml.dump(joint_cfg, f, allow_unicode=True)
+
+    cmd = [
+        sys.executable, 'train_joint.py',
+        '--config',     tmp_cfg,
+        '--device_num', args.device,
+    ]
+    return run(cmd, f"Stage 4: XFeat+LG 同時 fine-tune（init={init_type}）")
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +347,7 @@ def main():
         1: (stage1_kd,       "Stage 1: KD 事前学習"),
         2: (stage2_spatial,  "Stage 2: 空間分散損失 fine-tune"),
         3: (stage3_lg,       "Stage 3: LightGlue 再 fine-tune"),
+        4: (stage4_joint,    "Stage 4: XFeat+LG 同時 fine-tune"),
     }
 
     results = {}

@@ -245,3 +245,14 @@ If you find this code useful for your research, please cite the paper:
 <img align="left" width="auto" height="50" src="./figs/ufmg.png">
 <img align="right" width="auto" height="50" src="./figs/verlab.png">
 <br/>
+
+### 実行方法
+```
+python train_pipeline.py \
+    --config       configs/pipeline_config.yaml \
+    --sthereo_root datasets/sthereo \
+    --vivid_root   datasets/vivid \
+    --ms2_root     datasets/ms2 \
+    --init_type    rgb \
+    --device       0
+```

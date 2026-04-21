@@ -1,0 +1,45 @@
+# =============================================================================
+# eval_pipeline.yaml
+# evaluate_pipeline.py の設定ファイル
+# =============================================================================
+
+# ── データセット ─────────────────────────────────────────────────────────────
+data:
+  sthereo_root: "datasets/sthereo"
+  seq:          
+    - "kaist_morning"     # 評価シーケンス名
+    - "kaist_afternoon"
+    - "kaist_evening"
+  stride:       3                   # フレーム間隔
+
+# ── 評価設定 ─────────────────────────────────────────────────────────────────
+eval:
+  n_eval_pairs: 200    # 定量評価（PoseAUC, MS, Prec）に使うペア数
+  n_vis_pairs:  100     # 可視化するペア数
+  max_kp:       512    # XFeat の最大キーポイント数
+  inlier_thr:   3.0    # inlier 判定閾値（px）: 緑/赤の境界
+
+# ── 出力 ─────────────────────────────────────────────────────────────────────
+output:
+  dir:        "results/eval_pipeline_spatial_ms2_rgb"
+  save_csv:   true     # metrics.csv を保存
+  save_vis:   true     # 可視化画像を保存
+
+# ── モデル重み（4つの比較構成）────────────────────────────────────────────────
+#
+# Config A: XFeat(RGB)   + LG(RGB)     ← 完全 baseline
+# Config B: XFeat(Therm) + LG(RGB)     ← KD のみ効果確認
+# Config C: XFeat(RGB)   + LG(Therm)   ← LG のみ Thermal 適応確認
+# Config D: XFeat(Therm) + LG(Therm)   ← 完全 Thermal パイプライン
+#
+models:
+  # XFeat 重み
+  xfeat_rgb:   "weights/xfeat.pt"
+  xfeat_therm: "checkpoints/pipeline/stage2_spatial_ms2_rgb/best.pth"
+
+  # LightGlue 重み（null = cvg/LightGlue のデフォルト RGB 重みを使用）
+  matcher_rgb:   "weights/xfeat-lighterglue.pt"
+  matcher_therm: "checkpoints/pipeline/stage3_lg_rgb/lightglue_ft_final.pth"
+
+# ── 実行設定 ─────────────────────────────────────────────────────────────────
+device: "0"    # CUDA デバイス番号

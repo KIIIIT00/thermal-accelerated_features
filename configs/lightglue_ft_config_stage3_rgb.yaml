@@ -1,5 +1,5 @@
 batch_size: 4
-ckpt_save_path: checkpoints/pipeline/stage3_lg_ms2_aug_rgb
+ckpt_save_path: checkpoints/pipeline/stage3_lg_spatial_rgb
 data_roots:
   sthereo: datasets/sthereo
 ft_datasets:
@@ -9,6 +9,6 @@ max_keypoints: 512
 n_steps: 26000
 no_wandb: false
 stride: 3
-thermal_weights: checkpoints/pipeline/stage2_spatial_ms2_rgb/best.pth
+thermal_weights: checkpoints/pipeline/stage2_spatial_rgb/best.pth
 wandb_project: thermal-xfeat-kd
 wandb_run_name: stage3_lg_rgb

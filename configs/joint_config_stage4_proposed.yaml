@@ -1,0 +1,16 @@
+batch_size: 16
+ckpt_save_path: checkpoints/pipeline/stage4_proposed
+data_roots:
+  sthereo: datasets/sthereo
+ft_datasets:
+- sthereo
+lambda_match: 0.5
+lg_weights: checkpoints/pipeline/stage3_lg_spatial_proposed/lightglue_gf_final.pth
+lr: 1.0e-05
+max_keypoints: 512
+n_steps: 5000
+no_wandb: false
+stride: 3
+wandb_project: thermal-xfeat-kd
+wandb_run_name: stage4_joint_proposed
+xfeat_weights: checkpoints/pipeline/stage2_spatial_proposed/best.pth

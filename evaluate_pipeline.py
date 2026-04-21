@@ -209,12 +209,12 @@ def run_matching(
         # LightGlue マッチング
         idx0, idx1 = match(
             descs0, descs1, 'lightglue',
-            matcher=matcher,  
             ratio_thr=0.9,
             kpts1=kpts0, kpts2=kpts1,
             image_size=(size[1], size[0]),
             device=device,
         )
+
     if len(idx0) == 0:
         return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
 
@@ -691,7 +691,6 @@ def main():
     # ── [修正点] シーケンスごとの個別テーブル表示 ──────────────────────────
     # 表示したい指標とラベル、スケーリングの定義
     metrics_display = [
-        ('MS', 'MS(%)', 100)
         ('PoseAUC@5',  'AUC@5(%)',  100),
         ('PoseAUC@10', 'AUC@10(%)', 100),
         ('PoseAUC@20', 'AUC@20(%)', 100),

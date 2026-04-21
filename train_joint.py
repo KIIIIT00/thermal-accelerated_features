@@ -171,13 +171,33 @@ class JointTrainer:
             p.requires_grad_(False)
 
         # ── LightGlue（学習可能）─────────────────────────────────────────
-        from train_lightglue_ft import build_lg_model
+        try:
+            from lightglue import LightGlue
+        except ImportError:
+            raise ImportError(
+                "pip install git+https://github.com/cvg/LightGlue.git"
+            )
+
+        input_dim = cfg.get('input_dim', 64)
+        self.lg = LightGlue(
+            features         = None,
+            input_dim        = input_dim,
+            filter_threshold = -1.0,
+            depth_confidence = -1.0,
+            width_confidence = -1.0,
+            flash            = False,
+        ).to(device).train()
+
         lg_weights = cfg.get('lg_weights')
-        self.lg = build_lg_model(cfg, device)
         if lg_weights and os.path.isfile(lg_weights):
             self.lg.load_state_dict(
                 torch.load(lg_weights, map_location=device, weights_only=True))
             print(f"[Joint] LG loaded: {lg_weights}")
+        else:
+            print(f"[Joint] LG: default weights (lg_weights={lg_weights})")
+
+        n_lg = sum(p.numel() for p in self.lg.parameters() if p.requires_grad)
+        print(f"[Joint] LG trainable params: {n_lg:,}")
 
         self.lambda_match = cfg.get('lambda_match', 0.5)
         self.th_pos       = cfg.get('th_pos', 3.0)
@@ -267,6 +287,7 @@ class JointTrainer:
             img1  = batch['thr_t1'].to(self.device)
             T_rel = batch['T_rel'].to(self.device)
             K     = batch['K'].to(self.device)
+            valid = batch['valid']            # (B,) SThErEO は常に True
             B     = img0.shape[0]
 
             # ── XFeat KD 損失 ────────────────────────────────────────────
@@ -275,55 +296,108 @@ class JointTrainer:
             s_out     = self.xfeat(img0)
             l_kd      = kd_loss(s_out, t_out)
 
-            # ── LG マッチング損失 ─────────────────────────────────────────
+            # ── LG マッチング損失（Stage3 と同じ lightglue_matching_loss を使用）──
+            # cvg/LightGlue は .loss() メソッドを持たない
+            # → modules/training/train_lightglue_ft.py の損失関数を流用
+            from modules.training.train_lightglue_ft import (
+                lightglue_matching_loss, build_gt_labels, nll_one_layer)
+
             p0 = self._extract_kp(img0)
             p1 = self._extract_kp(img1)
 
             sz = torch.tensor([[img0.shape[-2], img0.shape[-1]]] * B,
                                dtype=torch.float32, device=self.device)
 
-            # GT マッチの生成（バッチ内で1ペアずつ）
-            gt0_list, gt1_list = [], []
+            l_match_list = []
             for b in range(B):
-                g0, g1 = compute_gt_matches(
-                    p0['keypoints'][b], p1['keypoints'][b],
-                    T_rel[b], K[b],
-                    self.th_pos, self.th_neg)
-                gt0_list.append(g0)
-                gt1_list.append(g1)
+                kpts1  = p0['keypoints'][b]    # (N1, 2)
+                kpts2  = p1['keypoints'][b]    # (N2, 2)
+                descs1 = p0['descriptors'][b]  # (N1, 64)
+                descs2 = p1['descriptors'][b]  # (N2, 64)
+                sc1    = p0['keypoint_scores'][b]
+                sc2    = p1['keypoint_scores'][b]
 
-            gt_m0 = self._pad([g.float() for g in gt0_list])   # (B, N)
-            gt_m1 = self._pad([g.float() for g in gt1_list])   # (B, M)
+                if kpts1.shape[0] < 8 or kpts2.shape[0] < 8:
+                    continue
 
-            lg_in = {
-                'image0': {
-                    'keypoints':       self._pad(p0['keypoints']),
-                    'descriptors':     self._pad(p0['descriptors']),
-                    'keypoint_scores': self._pad(p0['keypoint_scores']),
-                    'image_size':      sz,
-                },
-                'image1': {
-                    'keypoints':       self._pad(p1['keypoints']),
-                    'descriptors':     self._pad(p1['descriptors']),
-                    'keypoint_scores': self._pad(p1['keypoint_scores']),
-                    'image_size':      sz,
-                },
-                'gt_matches0': gt_m0.long(),
-                'gt_matches1': gt_m1.long(),
-            }
+                # LightGlue 入力形式に変換（Stage3 の _to_lg_input と同一）
+                H_, W_ = img0.shape[-2], img0.shape[-1]
+                def to_lg(kp, dc, sc):
+                    kn = kp.clone()
+                    kn[:, 0] = kp[:, 0] / W_ * 2.0 - 1.0
+                    kn[:, 1] = kp[:, 1] / H_ * 2.0 - 1.0
+                    return {
+                        'keypoints':       kn.unsqueeze(0),
+                        'descriptors':     dc.unsqueeze(0),
+                        'keypoint_scores': sc.unsqueeze(0),
+                    }
 
-            try:
-                pred      = self.lg(lg_in)
-                loss_dict = self.lg.loss(pred, lg_in)
-                l_match   = (loss_dict.get('total', next(iter(loss_dict.values())))
-                             if isinstance(loss_dict, dict) else loss_dict)
-            except Exception as e:
-                print(f"[step {step}] LG error: {e}")
-                step += 1
-                continue
+                try:
+                    pred = self.lg({'image0': to_lg(kpts1, descs1, sc1),
+                                    'image1': to_lg(kpts2, descs2, sc2)})
+                except Exception as e:
+                    print(f"[step {step}] LG forward error: {e}")
+                    continue
 
-            # ── 統合損失 ─────────────────────────────────────────────────
-            l_total = l_kd + self.lambda_match * l_match
+                # log_assignment の取得（Stage3 と同一ロジック）
+                scores_mat = None
+                if step == 0 and b == 0:
+                    print(f"[DIAG] pred keys: {list(pred.keys())}")
+                    for k, v in pred.items():
+                        if isinstance(v, torch.Tensor):
+                            print(f"  {k}: {v.shape}")
+                        elif isinstance(v, list):
+                            print(f"  {k}: list[{len(v)}]"
+                                  f" first={v[0].shape if v else 'empty'}")
+                if 'log_assignment' in pred:
+                    res = pred['log_assignment']
+                    if isinstance(res, (list, tuple)):
+                        scores_mat = res          # Deep Supervision
+                    elif isinstance(res, torch.Tensor):
+                        scores_mat = res[0] if res.ndim == 3 else res
+                if scores_mat is None:
+                    # フォールバック: matching_scores0 から擬似スコア行列を構築
+                    # cvg/LightGlue は eval モードで log_assignment を返さない
+                    if 'matching_scores0' in pred:
+                        ms0 = pred['matching_scores0'][0]   # (N1,)
+                        N1e, N2e = kpts1.shape[0], kpts2.shape[0]
+                        # (N1+1, N2+1) の擬似 log-assignment を構築
+                        sm = kpts1.new_full((N1e + 1, N2e + 1), -10.0)
+                        n  = min(N1e, N2e, ms0.shape[0])
+                        # 対角: マッチスコアの log
+                        sm[torch.arange(n), torch.arange(n)] = \
+                            ms0[:n].clamp(1e-6, 1-1e-6).log()
+                        # dustbin 列: 非マッチ確率の log
+                        sm[:N1e, N2e] = \
+                            (1.0 - ms0.clamp(1e-6, 1-1e-6)).log()
+                        scores_mat = sm
+                        if step == 0 and b == 0:
+                            print(f"[DIAG] matching_scores0 フォールバック使用")
+                    else:
+                        if step == 0 and b == 0:
+                            print(f"[DIAG] scores_mat 取得失敗 → skip")
+                        continue
+
+                # LightGlue 論文 Eq.11 準拠の損失（Stage3 と同一）
+                l_b = lightglue_matching_loss(
+                    scores      = scores_mat,
+                    pts1        = kpts1,
+                    pts2        = kpts2,
+                    K           = K[b],
+                    T_rel       = T_rel[b],
+                    use_gt      = valid[b].item(),
+                    inlier_thr  = self.th_pos,
+                    outlier_thr = self.th_neg,
+                )
+                if l_b.requires_grad:
+                    l_match_list.append(l_b)
+
+            if not l_match_list:
+                # LG 損失が計算できない場合は KD のみで更新
+                l_total = l_kd
+            else:
+                l_match = torch.stack(l_match_list).mean()
+                l_total = l_kd + self.lambda_match * l_match
 
             self.opt.zero_grad()
             l_total.backward()
@@ -332,18 +406,26 @@ class JointTrainer:
             self.opt.step()
 
             if step % 100 == 0:
-                msg = (f"[{step:05d}/{n_steps}] "
-                       f"total={l_total.item():.4f}  "
-                       f"kd={l_kd.item():.4f}  "
-                       f"match={l_match.item():.4f}")
+                kd_v = l_kd.item()
+                if l_match_list:
+                    match_v = l_match.item()
+                    msg = (f"[{step:05d}/{n_steps}] "
+                           f"total={l_total.item():.4f}  "
+                           f"kd={kd_v:.4f}  "
+                           f"match={match_v:.4f}")
+                else:
+                    msg = (f"[{step:05d}/{n_steps}] "
+                           f"total={l_total.item():.4f}  "
+                           f"kd={kd_v:.4f}  match=n/a")
                 print(msg)
                 if self.use_wandb:
                     try:
                         import wandb
-                        wandb.log({'joint/total': l_total.item(),
-                                   'joint/kd':    l_kd.item(),
-                                   'joint/match': l_match.item()},
-                                  step=step)
+                        log_d = {'joint/total': l_total.item(),
+                                 'joint/kd':    kd_v}
+                        if l_match_list:
+                            log_d['joint/match'] = match_v
+                        wandb.log(log_d, step=step)
                     except Exception:
                         pass
 

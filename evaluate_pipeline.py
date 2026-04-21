@@ -571,11 +571,24 @@ def load_yaml_config(path: str) -> dict:
     out    = cfg.get('output', {})
     models = cfg.get('models', {})
 
-    seqs_raw = data.get('seqs') or data.get('seq', 'kaist_morning')
-    seqs     = seqs_raw if isinstance(seqs_raw, list) else [seqs_raw]
+    # 'seqs' があればそれを、なければ 'seq' を取得
+    seqs_raw = data.get('seqs') or data.get('seq', ['kaist_morning'])
+    
+    # 古い設定（リスト形式）の場合は 'sthereo' のシーケンスとして互換性を持たせる
+    if isinstance(seqs_raw, list):
+        seqs = {'sthereo': seqs_raw}
+    elif isinstance(seqs_raw, dict):
+        seqs = seqs_raw
+    else:
+        seqs = {'sthereo': [seqs_raw]}
+
+    # データセットのルートパス取得
+    datasets = data.get('datasets', {})
+    if not datasets and 'sthereo_root' in data:
+        datasets = {'sthereo': data.get('sthereo_root')}
 
     return {
-        'sthereo_root': data.get('sthereo_root', 'datasets/sthereo'),
+        'data_roots':   datasets,
         'seqs':         seqs,
         'stride':       int(data.get('stride', 3)),
         'n_eval_pairs': int(ev.get('n_eval_pairs', 200)),
@@ -599,21 +612,11 @@ def load_yaml_config(path: str) -> dict:
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument('--config', default='configs/eval_pipeline.yaml')
-    p.add_argument('--seqs',   nargs='+', default=None)
-    p.add_argument('--seq',    default=None)
-    p.add_argument('--n_eval_pairs', type=int, default=None)
-    p.add_argument('--n_vis_pairs',  type=int, default=None)
-    p.add_argument('--output_dir',   default=None)
-    p.add_argument('--device',       default=None)
+    p.add_argument('--device', default=None)
     cli = p.parse_args()
 
     cfg = load_yaml_config(cli.config)
-    if cli.seqs         is not None: cfg['seqs']         = cli.seqs
-    elif cli.seq        is not None: cfg['seqs']         = [cli.seq]
-    if cli.n_eval_pairs is not None: cfg['n_eval_pairs'] = cli.n_eval_pairs
-    if cli.n_vis_pairs  is not None: cfg['n_vis_pairs']  = cli.n_vis_pairs
-    if cli.output_dir   is not None: cfg['output_dir']   = cli.output_dir
-    if cli.device       is not None: cfg['device']       = cli.device
+    if cli.device is not None: cfg['device'] = cli.device
 
     ns = types.SimpleNamespace(**cfg)
     ns.config = cli.config
@@ -639,33 +642,27 @@ def load_xfeat(weights: Optional[str], device: torch.device) -> torch.nn.Module:
 
 
 def load_matcher(matcher_path: Optional[str], device: torch.device) -> Optional[object]:
-    """
-    重みファイルのテンソルサイズを自動解析し、アーキテクチャを決定してロードする。
-    """
     if matcher_path is None:
         print(f"    Matcher: MNN (mutual nearest neighbor)")
         return None
 
-    # 1. チェックポイントを読み込み、次元数を検査
     ckpt = torch.load(matcher_path, map_location='cpu', weights_only=False)
     state_dict = ckpt.get('model', ckpt)
     
     is_large_model = False
     for k, v in state_dict.items():
         if 'input_proj.weight' in k:
-            if v.shape[0] == 256:  # glue-factoryで学習された特徴的なサイズ
+            if v.shape[0] == 256: 
                 is_large_model = True
             break
 
     if not is_large_model:
-        # XFeat用の軽量モデル (96次元)
         from modules.lighterglue import LighterGlue
         print(f"    Matcher: LighterGlue(Small) ← {matcher_path}")
         lg = LighterGlue(weights=matcher_path).to(device)
         lg.eval()
         return lg
     else:
-        # glue-factoryで学習されたフルサイズモデル (256次元)
         print(f"    Matcher: LightGlue(Large/GF) ← {matcher_path}")
         _THIS = os.path.dirname(os.path.abspath(__file__))
         _GF   = os.path.join(_THIS, 'third_party', 'glue-factory')
@@ -739,7 +736,6 @@ def run_matching(
     if matcher is None:
         idx0, idx1 = match(descs0, descs1, 'mutual_nn', ratio_thr=0.9)
     else:
-        # モデルのクラス名で推論方法を自動分岐
         if matcher.__class__.__name__ == 'LighterGlue':
             kpts0_t = torch.from_numpy(kpts0).unsqueeze(0).to(device)
             descs0_t = torch.from_numpy(descs0).unsqueeze(0).to(device)
@@ -771,7 +767,6 @@ def run_matching(
             else:
                 idx0, idx1 = match(descs0, descs1, 'mutual_nn', ratio_thr=0.9)
         else:
-            # glue-factory LightGlue の場合
             from eval.eval_matching import match_lightglue
             idx0, idx1 = match_lightglue(
                 kpts0, descs0, kpts1, descs1,
@@ -783,7 +778,6 @@ def run_matching(
     if len(idx0) == 0:
         return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
 
-    # リサイズ後座標 → 元解像度座標に変換
     sx = W / size[0]
     sy = H / size[1]
     m0 = kpts0[idx0].copy(); m0[:, 0] *= sx; m0[:, 1] *= sy
@@ -990,44 +984,103 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"  Pipeline 評価・可視化")
+    print(f"  Pipeline 評価・可視化 (Multi-Dataset)")
     print(f"  config:       {args.config}")
-    print(f"  seqs:         {args.seqs}")
     print(f"  n_eval_pairs: {args.n_eval_pairs}")
-    print(f"  n_vis_pairs:  {args.n_vis_pairs}")
     print(f"  output_dir:   {args.output_dir}")
     print(f"  device:       {device}")
     print(f"{'='*60}\n")
 
     # ── データ収集 ──────────────────────────────────────────────────────
-    from modules.dataset.thermal.sequential import SThErEOSequentialDataset
-    pairs_all: List[Tuple] = []
-    for split_ in ['train', 'val']:
-        try:
-            ds = SThErEOSequentialDataset(
-                data_root=args.sthereo_root,
-                stride=args.stride,
-                split=split_,
-                max_pairs_per_seq=args.n_eval_pairs,
-            )
-            pairs_all.extend(ds._pairs)
-        except Exception:
-            pass
+    from modules.dataset.thermal.sequential import (
+        SThErEOSequentialDataset,
+        VividSequentialDataset,
+        MS2SequentialDataset,
+        TartanRGBTSequentialDataset
+    )
 
     seq_pairs: Dict[str, List] = {}
-    for sn in args.seqs:
-        sp = [p for p in pairs_all if sn in p[0]]
-        if not sp:
-            print(f"[警告] {sn} が見つかりません → スキップ")
-            continue
-        seq_pairs[sn] = sp
-        print(f"[データ] {sn}: {len(sp)} ペア")
+    
+    # ユーザーが要求したすべてのシーケンス名をリスト化
+    all_requested_seqs = []
+    for ds_name, s_list in args.seqs.items():
+        if isinstance(s_list, list):
+            all_requested_seqs.extend(s_list)
+
+    print("[データ収集を開始します...]")
+
+    # 1. SThErEO の収集
+    if 'sthereo' in args.data_roots and args.seqs.get('sthereo'):
+        ds_root = args.data_roots['sthereo']
+        if os.path.exists(ds_root):
+            for split_ in ['train', 'val']:
+                try:
+                    ds = SThErEOSequentialDataset(
+                        data_root=ds_root, stride=args.stride, 
+                        split=split_, max_pairs_per_seq=args.n_eval_pairs)
+                    for target_seq in args.seqs['sthereo']:
+                        sp = [p for p in ds._pairs if target_seq in p[0]]
+                        if sp:
+                            seq_pairs[f"[SThErEO] {target_seq}"] = sp
+                except Exception:
+                    pass
+
+    # 2. VIVID の収集
+    if 'vivid' in args.data_roots and args.seqs.get('vivid'):
+        ds_root = args.data_roots['vivid']
+        if os.path.exists(ds_root):
+            for split_ in ['train', 'val']:
+                try:
+                    ds = VividSequentialDataset(
+                        data_root=ds_root, stride=args.stride, 
+                        split=split_, max_pairs_per_seq=args.n_eval_pairs)
+                    for target_seq in args.seqs['vivid']:
+                        sp = [p for p in ds._pairs if target_seq in p[0]]
+                        if sp:
+                            seq_pairs[f"[VIVID] {target_seq}"] = sp
+                except Exception:
+                    pass
+
+    # 3. MS2 の収集
+    if 'ms2' in args.data_roots and args.seqs.get('ms2'):
+        ds_root = args.data_roots['ms2']
+        if os.path.exists(ds_root):
+            for split_ in ['train', 'val']:
+                try:
+                    ds = MS2SequentialDataset(
+                        data_root=ds_root, stride=args.stride, 
+                        split=split_, max_pairs_per_seq=args.n_eval_pairs)
+                    for target_seq in args.seqs['ms2']:
+                        sp = [p for p in ds._pairs if target_seq in p[0]]
+                        if sp:
+                            seq_pairs[f"[MS2] {target_seq}"] = sp
+                except Exception:
+                    pass
+
+    # 4. TartanRGBT の収集
+    if 'tartanrgbt' in args.data_roots and args.seqs.get('tartanrgbt'):
+        ds_root = args.data_roots['tartanrgbt']
+        if os.path.exists(ds_root):
+            try:
+                ds = TartanRGBTSequentialDataset(
+                    data_root=ds_root, stride=args.stride, 
+                    max_pairs_per_seq=args.n_eval_pairs)
+                for target_seq in args.seqs['tartanrgbt']:
+                    sp = [p for p in ds._pairs if target_seq in p[0]]
+                    if sp:
+                        seq_pairs[f"[Tartan] {target_seq}"] = sp
+            except Exception:
+                pass
+
     print()
+    for name, sp in seq_pairs.items():
+        print(f"  {name}: {len(sp)} ペア抽出完了")
+        
     if not seq_pairs:
-        print("[ERROR] 有効なシーケンスがありません"); return
+        print("\n[ERROR] 有効なシーケンスがありません。パス設定と seqs 設定を確認してください。"); return
 
     # ── モデルロード ─────────────────────────────────────────────────────
-    print("[Config A] XFeat(RGB)  + Matcher(RGB)")
+    print("\n[Config A] XFeat(RGB)  + Matcher(RGB)")
     xfeat_rgb    = load_xfeat(args.xfeat_rgb, device)
     matcher_rgb  = load_matcher(args.matcher_rgb, device)
 
@@ -1062,11 +1115,9 @@ def main():
     # ── 定量評価（シーケンスごと）────────────────────────────────────────
     print(f"[定量評価] n_eval_pairs={args.n_eval_pairs} / シーケンス\n")
     
-    # Headerの Config を Model に変更
-    header = f"  {'Model':<25} {'Seq':<16} {'MS(Mean)':>8} {'MS(Min)':>8} {'MS(Max)':>8} {'AUC@5':>8} {'AUC@10':>8} {'AUC@20':>8} {'Prec':>8}"
+    header = f"  {'Model':<25} {'Seq':<30} {'MS(Mean)':>8} {'MS(Min)':>8} {'MS(Max)':>8} {'AUC@5':>8} {'AUC@10':>8} {'AUC@20':>8} {'Prec':>8}"
     print(header)
 
-    # 1. まず全ての評価を実行し、結果を辞書に格納する
     for cfg in configs:
         per_seq: Dict[str, Dict] = {}
         for sn, sp in seq_pairs.items():
@@ -1080,26 +1131,18 @@ def main():
         cfg['per_seq'] = per_seq
         cfg['metrics'] = avg
 
-    # 2. シーケンスごとにグループ化して表示・CSVデータを作成
     all_seqs = list(seq_pairs.keys()) + ['avg']
     csv_rows = []
 
     for sn in all_seqs:
-        print("  " + "-" * 105)
+        print("  " + "-" * 118)
         for cfg in configs:
-            if sn == 'avg':
-                m = cfg['metrics']
-            else:
-                m = cfg['per_seq'][sn]
-            
-            # Configの代わりにModelとして名前を表示
-            row = f"  {cfg['name'][:25]:<25} {sn[:16]:<16} {m['MS_mean']*100:>7.1f}% {m['MS_min']*100:>7.1f}% {m['MS_max']*100:>7.1f}% {m['PoseAUC@5']*100:>7.1f}% {m['PoseAUC@10']*100:>7.1f}% {m['PoseAUC@20']*100:>7.1f}% {m['Prec@3px']*100:>7.1f}%"
+            m = cfg['metrics'] if sn == 'avg' else cfg['per_seq'][sn]
+            row = f"  {cfg['name'][:25]:<25} {sn[:30]:<30} {m['MS_mean']*100:>7.1f}% {m['MS_min']*100:>7.1f}% {m['MS_max']*100:>7.1f}% {m['PoseAUC@5']*100:>7.1f}% {m['PoseAUC@10']*100:>7.1f}% {m['PoseAUC@20']*100:>7.1f}% {m['Prec@3px']*100:>7.1f}%"
             print(row)
             
-            # CSV行の準備
             csv_rows.append({
-                'Model': cfg['name'], 
-                'Seq': sn,
+                'Model': cfg['name'], 'Seq': sn,
                 'MS_mean(%)': round(m['MS_mean']*100, 2),
                 'MS_min(%)': round(m['MS_min']*100, 2),
                 'MS_max(%)': round(m['MS_max']*100, 2),
@@ -1109,12 +1152,11 @@ def main():
                 'PoseAUC@10(%)': round(m['PoseAUC@10']*100, 2),
                 'PoseAUC@20(%)': round(m['PoseAUC@20']*100, 2)
             })
-    print("  " + "-" * 105)
+    print("  " + "-" * 118)
 
     if args.save_csv:
         csv_path = os.path.join(args.output_dir, 'metrics.csv')
         with open(csv_path, 'w') as f:
-            # HeaderをModelに変更
             f.write('Model,Seq,MS_mean(%),MS_min(%),MS_max(%),Prec@3px(%),n_match,'
                     'PoseAUC@5(%),PoseAUC@10(%),PoseAUC@20(%)\n')
             for r in csv_rows:
@@ -1128,7 +1170,9 @@ def main():
     if args.save_vis:
         print(f"\n[可視化] {args.n_vis_pairs} ペア × {len(seq_pairs)} シーケンス")
         for sn, sp in seq_pairs.items():
-            seq_dir = os.path.join(args.output_dir, sn)
+            # ファイルパスとして安全な名前に置換
+            safe_sn = sn.replace('[', '').replace('] ', '_')
+            seq_dir = os.path.join(args.output_dir, safe_sn)
             os.makedirs(seq_dir, exist_ok=True)
             print(f"  [{sn}]")
             for i, (p0, p1, T_rel_t, K_t) in enumerate(sp[:args.n_vis_pairs]):
@@ -1143,7 +1187,6 @@ def main():
     print(f"\n{'='*60}")
     print(f"  評価完了  →  {args.output_dir}/")
     print(f"{'='*60}")
-
 
 if __name__ == '__main__':
     main()

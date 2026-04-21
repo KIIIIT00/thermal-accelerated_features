@@ -5,11 +5,25 @@
 
 # ── データセット ─────────────────────────────────────────────────────────────
 data:
-  sthereo_root: "datasets/sthereo"
-  seq:          
-    - "kaist_morning"     # 評価シーケンス名
-    - "kaist_afternoon"
-    - "kaist_evening"
+  datasets:
+    sthereo: "datasets/sthereo"
+    vivid: "datasets/vivid"
+    ms2: "datasets/ms2"
+    tartanrgbt: "datasets/tartanRGBT"
+  seqs:
+    sthereo:
+      - "kaist_morning"
+      - "kaist_afternoon"
+      - "kaist_evening"
+    vivid:
+      - "driving_full/campus_day1"
+      - "driving_full/campus_day2"
+      - "driving_full/city_day1"
+      - "driving_full/urban_day"
+      - "driving_vision/campus_day1"
+    ms2:
+      - "_2021-08-06-11-23-45"
+    tartanrgbt: [] # 評価しない場合は空リストにするか省略
   stride:       3                   # フレーム間隔
 
 # ── 評価設定 ─────────────────────────────────────────────────────────────────
@@ -35,7 +49,7 @@ output:
 models:
   # XFeat 重み
   xfeat_rgb:   "weights/xfeat.pt"
-  xfeat_therm: "checkpoints/pipeline/stage2_spatial_ms2_rgb/best.pth"
+  xfeat_therm: "checkpoints/pipeline/stage2_rgb/best.pth"
 
   # LightGlue 重み（null = cvg/LightGlue のデフォルト RGB 重みを使用）
   matcher_rgb:   "weights/xfeat-lighterglue.pt"

@@ -41,5 +41,9 @@ models:
   matcher_rgb:   "weights/xfeat-lighterglue.pt"
   matcher_therm: "checkpoints/pipeline/stage3_lg_rgb/lightglue_ft_final.pth"
 
+  compare_pipeline: true
+  xfeat_pipe_therm: "checkpoints/pipeline/stage4_rgb/xfeat_joint.pth"
+  matcher_pipe_therm: "checkpoints/pipeline/stage4_rgb/lg_joint.pth"
+
 # ── 実行設定 ─────────────────────────────────────────────────────────────────
 device: "0"    # CUDA デバイス番号

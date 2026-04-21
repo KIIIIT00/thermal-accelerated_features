@@ -126,39 +126,17 @@ def load_matcher(matcher_path: Optional[str],
     matcher_path が文字列 → glue-factory 形式の LightGlue checkpoint をロード
     """
     if matcher_path is None:
+        print(f"    Matcher: MNN (mutual nearest neighbor)")
         return None
 
-    try:
-        # ── [修正] プロジェクト内のモデル定義をインポート ──
-        from modules.lighterglue import LightGlue
-        
-        # モデルのインスタンス化 (input_dim=64 など、学習時と同一にする)
-        model = LightGlue(features=None).to(device).eval()
-
-        # 重みのロード
-        ckpt = torch.load(matcher_path, map_location=device)
-        
-        # ── [論理的修正] KeyError: 'model' 回避ロジック ──
-        if isinstance(ckpt, dict):
-            if 'model' in ckpt:
-                state_dict = ckpt['model'] # glue-factory 形式
-            elif 'state_dict' in ckpt:
-                state_dict = ckpt['state_dict']
-            else:
-                state_dict = ckpt # 辞書そのものが重み
-        else:
-            state_dict = ckpt
-
-        # キー名の微調整 (model. プレフィックスが付いている場合などの対策)
-        # strict=False にすることで、多少の名称差異を許容してロードを優先します
-        model.load_state_dict(state_dict, strict=False)
-        
-        print(f"    Matcher: LightGlue loaded from {matcher_path}")
-        return model
-
-    except Exception as e:
-        print(f"    [ERROR] Matcher ロード失敗: {e}")
-        return None
+    # evaluate/eval_matching.py の load_lightglue を使用
+    from eval.eval_matching import load_lightglue as _load_lg
+    lg = _load_lg(weights_path=matcher_path, device=device)
+    if lg is not None:
+        print(f"    Matcher: LightGlue ← {matcher_path}")
+    else:
+        print(f"    Matcher: LightGlue ロード失敗 → MNN にフォールバック")
+    return lg
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +313,6 @@ def evaluate_config(
         'n_match':     float(np.mean([m * max_kp for m in ms_list])) if ms_list else 0.0,
         'PoseAUC@5':   auc(pose_errs, 5.0),
         'PoseAUC@10':  auc(pose_errs, 10.0),
-        'PoseAUC@20':  auc(pose_errs, 20.0),
     }
 
 
@@ -430,198 +407,6 @@ def visualize_pair(
 # メイン
 # ---------------------------------------------------------------------------
 
-# def main():
-#     args = get_args()
-#     os.environ['CUDA_VISIBLE_DEVICES'] = args.device
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#     os.makedirs(args.output_dir, exist_ok=True)
-
-#     print(f"\n{'='*60}")
-#     print(f"  Pipeline 評価・可視化")
-#     print(f"  config:       {args.config}")
-#     print(f"  seqs:         {args.seqs}")
-#     print(f"  n_eval_pairs: {args.n_eval_pairs}")
-#     print(f"  n_vis_pairs:  {args.n_vis_pairs}")
-#     print(f"  output_dir:   {args.output_dir}")
-#     print(f"  device:       {device}")
-#     print(f"{'='*60}\n")
-
-#     # ── データ収集 ──────────────────────────────────────────────────────
-#     from modules.dataset.thermal.sequential import SThErEOSequentialDataset
-#     pairs_all: List[Tuple] = []
-#     for split_ in ['train', 'val']:
-#         try:
-#             ds = SThErEOSequentialDataset(
-#                 data_root=args.sthereo_root,
-#                 stride=args.stride,
-#                 split=split_,
-#                 max_pairs_per_seq=args.n_eval_pairs,
-#             )
-#             pairs_all.extend(ds._pairs)
-#         except Exception:
-#             pass
-
-#     seq_pairs: Dict[str, List] = {}
-#     for sn in args.seqs:
-#         sp = [p for p in pairs_all if sn in p[0]]
-#         if not sp:
-#             print(f"[警告] {sn} が見つかりません → スキップ")
-#             continue
-#         seq_pairs[sn] = sp
-#         print(f"[データ] {sn}: {len(sp)} ペア")
-#     print()
-#     if not seq_pairs:
-#         print("[ERROR] 有効なシーケンスがありません"); return
-
-#     # ── モデルロード ─────────────────────────────────────────────────────
-#     # print("[Config A] XFeat(RGB)  + Matcher(RGB)")
-#     # xfeat_rgb    = load_xfeat(args.xfeat_rgb, device)
-#     # matcher_rgb  = load_matcher(args.matcher_rgb, device)
-
-#     # print("\n[Config B] XFeat(Therm)+ Matcher(RGB)")
-#     # xfeat_therm  = load_xfeat(args.xfeat_therm, device)
-
-#     # print("\n[Config C] XFeat(RGB)  + Matcher(Therm)")
-#     # matcher_therm = load_matcher(args.matcher_therm, device)
-
-#     # print("\n[Config D] XFeat(Therm)+ Matcher(Therm)\n")
-
-#     # configs = [
-#     #     {'name': 'A: XFeat(RGB)  +Matcher(RGB)',
-#     #      'xfeat': xfeat_rgb,   'matcher': matcher_rgb},
-#     #     {'name': 'B: XFeat(Therm)+Matcher(RGB)',
-#     #      'xfeat': xfeat_therm, 'matcher': matcher_rgb},
-#     #     {'name': 'C: XFeat(RGB)  +Matcher(Therm)',
-#     #      'xfeat': xfeat_rgb,   'matcher': matcher_therm},
-#     #     {'name': 'D: XFeat(Therm)+Matcher(Therm)',
-#     #      'xfeat': xfeat_therm, 'matcher': matcher_therm},
-#     # ]
-#     print("[Config A/B] Loading LightGlue (RGB weights)...")
-#     matcher_rgb = load_matcher(args.matcher_rgb, device)
-#     if matcher_rgb is None:
-#         raise RuntimeError("Config A/B 用の重みがロードできません。YAML のパスを確認してください。")
-
-#     print("\n[Config C/D] Loading LightGlue (Thermal weights)...")
-#     matcher_therm = load_matcher(args.matcher_therm, device)
-#     if matcher_therm is None:
-#         raise RuntimeError("Config C/D 用の重みがロードできません。")
-
-#     xfeat_rgb   = load_xfeat(args.xfeat_rgb, device)
-#     xfeat_therm = load_xfeat(args.xfeat_therm, device)
-
-#     configs = [
-#         {'name': 'A: XFeat(RGB)  + LG(RGB)',   'xfeat': xfeat_rgb,   'matcher': matcher_rgb},
-#         {'name': 'B: XFeat(Therm)+ LG(RGB)',   'xfeat': xfeat_therm, 'matcher': matcher_rgb},
-#         {'name': 'C: XFeat(RGB)  + LG(Therm)', 'xfeat': xfeat_rgb,   'matcher': matcher_therm},
-#         {'name': 'D: XFeat(Therm)+ LG(Therm)', 'xfeat': xfeat_therm, 'matcher': matcher_therm},
-#     ]
-#     print(f"\n[Status] All 4 configurations are ready using LightGlue.")
-
-#     # ── 定量評価（シーケンスごと）────────────────────────────────────────
-#     col_w = 16
-#     print(f"[定量評価] n_eval_pairs={args.n_eval_pairs} / シーケンス")
-#     print(f"  {'指標':<6} {'Config':<32}", end='')
-#     for sn in seq_pairs: print(f" {sn[:col_w]:>{col_w}}", end='')
-#     print(f" {'avg':>{col_w}}")
-#     print("  " + "-" * (6 + 32 + col_w * (len(seq_pairs)+1) + 2))
-
-#     csv_rows = []
-#     for cfg in configs:
-#         per_seq: Dict[str, Dict] = {}
-#         for sn, sp in seq_pairs.items():
-#             m = evaluate_config(cfg['xfeat'], cfg['matcher'], sp, device,
-#                                 args.n_eval_pairs, args.max_kp, args.inlier_thr)
-#             per_seq[sn] = m
-
-#         keys = ['MS', 'Prec@3px', 'PoseAUC@5', 'PoseAUC@10']
-#         avg  = {k: float(np.mean([v[k] for v in per_seq.values()])) for k in keys}
-#         avg['n_match'] = float(np.mean([v['n_match'] for v in per_seq.values()]))
-#         cfg['per_seq'] = per_seq
-#         cfg['metrics'] = avg
-
-#         # 表示（PoseAUC@5 行）
-#         row = f"  {'AUC@5':<6} {cfg['name']:<32}"
-#         for sn in seq_pairs:
-#             row += f" {per_seq[sn]['PoseAUC@5']*100:>{col_w}.1f}%"
-#         row += f" {avg['PoseAUC@5']*100:>{col_w}.1f}%"
-#         print(row)
-
-#         # CSV
-#         for sn, m in per_seq.items():
-#             csv_rows.append({'Config': cfg['name'], 'Seq': sn,
-#                 'MS(%)': round(m['MS']*100, 2),
-#                 'Prec@3px(%)': round(m['Prec@3px']*100, 2),
-#                 'n_match': round(m['n_match'], 0),
-#                 'PoseAUC@5(%)': round(m['PoseAUC@5']*100, 2),
-#                 'PoseAUC@10(%)': round(m['PoseAUC@10']*100, 2)})
-#         csv_rows.append({'Config': cfg['name'], 'Seq': 'avg',
-#             'MS(%)': round(avg['MS']*100, 2),
-#             'Prec@3px(%)': round(avg['Prec@3px']*100, 2),
-#             'n_match': round(avg['n_match'], 0),
-#             'PoseAUC@5(%)': round(avg['PoseAUC@5']*100, 2),
-#             'PoseAUC@10(%)': round(avg['PoseAUC@10']*100, 2)})
-
-#     if args.save_csv:
-#         csv_path = os.path.join(args.output_dir, 'metrics.csv')
-#         with open(csv_path, 'w') as f:
-#             f.write('Config,Seq,MS(%),Prec@3px(%),n_match,'
-#                     'PoseAUC@5(%),PoseAUC@10(%)\n')
-#             for r in csv_rows:
-#                 f.write(f"{r['Config']},{r['Seq']},{r['MS(%)']},"
-#                         f"{r['Prec@3px(%)']},"
-#                         f"{r['n_match']},{r['PoseAUC@5(%)']},"
-#                         f"{r['PoseAUC@10(%)']}\n")
-#         print(f"\n  CSV 保存: {csv_path}")
-
-#     # ── 可視化 ────────────────────────────────────────────────────────
-#     # if args.save_vis:
-#     #     print(f"\n[可視化] {args.n_vis_pairs} ペア × {len(seq_pairs)} シーケンス")
-#     #     for sn, sp in seq_pairs.items():
-#     #         seq_dir = os.path.join(args.output_dir, sn)
-#     #         os.makedirs(seq_dir, exist_ok=True)
-#     #         print(f"  [{sn}]")
-#     #         for i, (p0, p1, T_rel_t, K_t) in enumerate(sp[:args.n_vis_pairs]):
-#     #             T_rel = np.array(T_rel_t, dtype=np.float64)
-#     #             K     = np.array(K_t,     dtype=np.float64)
-#     #             for cfg in configs:
-#     #                 cfg['metrics'] = cfg['per_seq'][sn]
-#     #             out = os.path.join(seq_dir, f'pair_{i:03d}.png')
-#     #             visualize_pair(configs, p0, p1, T_rel, K, out,
-#     #                            args.max_kp, args.inlier_thr, device)
-
-#     # print(f"\n{'='*60}")
-#     # print(f"  評価完了  →  {args.output_dir}/")
-#     # print(f"{'='*60}")
-#     if args.save_vis:
-#         print(f"\n[可視化開始] {args.n_vis_pairs} ペア × {len(seq_pairs)} シーケンス")
-        
-#         for sn, sp in seq_pairs.items():
-#             seq_dir = os.path.join(args.output_dir, sn)
-#             os.makedirs(seq_dir, exist_ok=True)
-#             print(f"  > シーケンス処理中: [{sn}]")
-            
-#             # 指定された枚数（n_vis_pairs）だけループ
-#             n_target = min(len(sp), args.n_vis_pairs)
-#             for i, (p0, p1, T_rel_t, K_t) in enumerate(sp[:n_target]):
-#                 T_rel = np.array(T_rel_t, dtype=np.float64)
-#                 K     = np.array(K_t,     dtype=np.float64)
-                
-#                 # 指標を現在のシーケンスのものに同期（画像キャプション用）
-#                 for cfg in configs:
-#                     cfg['metrics'] = cfg['per_seq'][sn]
-                
-#                 out_path = os.path.join(seq_dir, f'pair_{i:03d}.png')
-                
-#                 # ── [追加] 進捗状況の表示 ──
-#                 # 5ペアごと、または最後のペアの時にログを出力
-#                 if (i + 1) % 5 == 0 or (i + 1) == n_target:
-#                     print(f"    - 進捗: {sn} ({i+1}/{n_target}) 枚目の画像を生成中...")
-
-#                 # visualize_pair 内部で cfg['name'] が自動的に画像タイトルとして使用されます
-#                 visualize_pair(configs, p0, p1, T_rel, K, out_path,
-#                                args.max_kp, args.inlier_thr, device)
-
-#         print(f"\n[完了] 全ての可視化画像が保存されました。")
 def main():
     args = get_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device
@@ -629,8 +414,13 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"  Pipeline 評価・可視化 (Matcher: All LightGlue)")
-    print(f"  device: {device}")
+    print(f"  Pipeline 評価・可視化")
+    print(f"  config:       {args.config}")
+    print(f"  seqs:         {args.seqs}")
+    print(f"  n_eval_pairs: {args.n_eval_pairs}")
+    print(f"  n_vis_pairs:  {args.n_vis_pairs}")
+    print(f"  output_dir:   {args.output_dir}")
+    print(f"  device:       {device}")
     print(f"{'='*60}\n")
 
     # ── データ収集 ──────────────────────────────────────────────────────
@@ -639,110 +429,126 @@ def main():
     for split_ in ['train', 'val']:
         try:
             ds = SThErEOSequentialDataset(
-                data_root=args.sthereo_root, stride=args.stride,
-                split=split_, max_pairs_per_seq=args.n_eval_pairs,
+                data_root=args.sthereo_root,
+                stride=args.stride,
+                split=split_,
+                max_pairs_per_seq=args.n_eval_pairs,
             )
             pairs_all.extend(ds._pairs)
-        except Exception: pass
+        except Exception:
+            pass
 
     seq_pairs: Dict[str, List] = {}
     for sn in args.seqs:
         sp = [p for p in pairs_all if sn in p[0]]
-        if sp:
-            seq_pairs[sn] = sp
-            print(f"[データ] {sn}: {len(sp)} ペア")
+        if not sp:
+            print(f"[警告] {sn} が見つかりません → スキップ")
+            continue
+        seq_pairs[sn] = sp
+        print(f"[データ] {sn}: {len(sp)} ペア")
+    print()
+    if not seq_pairs:
+        print("[ERROR] 有効なシーケンスがありません"); return
 
-    # ── モデルロード (LighterGlue 定義を使用) ──────────────────────────
-    print("\n[Config A/B] Loading LG (RGB weights)...")
-    matcher_rgb = load_matcher(args.matcher_rgb, device)
-    if matcher_rgb is None: raise RuntimeError("RGB用重みのロードに失敗しました。")
+    # ── モデルロード ─────────────────────────────────────────────────────
+    print("[Config A] XFeat(RGB)  + Matcher(RGB)")
+    xfeat_rgb    = load_xfeat(args.xfeat_rgb, device)
+    matcher_rgb  = load_matcher(args.matcher_rgb, device)
 
-    print("[Config C/D] Loading LG (Thermal weights)...")
+    print("\n[Config B] XFeat(Therm)+ Matcher(RGB)")
+    xfeat_therm  = load_xfeat(args.xfeat_therm, device)
+
+    print("\n[Config C] XFeat(RGB)  + Matcher(Therm)")
     matcher_therm = load_matcher(args.matcher_therm, device)
-    if matcher_therm is None: raise RuntimeError("Thermal用重みのロードに失敗しました。")
 
-    xfeat_rgb   = load_xfeat(args.xfeat_rgb, device)
-    xfeat_therm = load_xfeat(args.xfeat_therm, device)
+    print("\n[Config D] XFeat(Therm)+ Matcher(Therm)\n")
 
     configs = [
-        {'name': 'A: XFeat(RGB)  + LG(RGB)',   'xfeat': xfeat_rgb,   'matcher': matcher_rgb},
-        {'name': 'B: XFeat(Therm)+ LG(RGB)',   'xfeat': xfeat_therm, 'matcher': matcher_rgb},
-        {'name': 'C: XFeat(RGB)  + LG(Therm)', 'xfeat': xfeat_rgb,   'matcher': matcher_therm},
-        {'name': 'D: XFeat(Therm)+ LG(Therm)', 'xfeat': xfeat_therm, 'matcher': matcher_therm},
+        {'name': 'A: XFeat(RGB)  +Matcher(RGB)',
+         'xfeat': xfeat_rgb,   'matcher': matcher_rgb},
+        {'name': 'B: XFeat(Therm)+Matcher(RGB)',
+         'xfeat': xfeat_therm, 'matcher': matcher_rgb},
+        {'name': 'C: XFeat(RGB)  +Matcher(Therm)',
+         'xfeat': xfeat_rgb,   'matcher': matcher_therm},
+        {'name': 'D: XFeat(Therm)+Matcher(Therm)',
+         'xfeat': xfeat_therm, 'matcher': matcher_therm},
     ]
 
-    # ── 定量評価の実行 ──────────────────────────────────────────────────
-    print(f"\n[計算中] 指標を算出しています...")
+    # ── 定量評価（シーケンスごと）────────────────────────────────────────
+    col_w = 16
+    print(f"[定量評価] n_eval_pairs={args.n_eval_pairs} / シーケンス")
+    print(f"  {'指標':<6} {'Config':<32}", end='')
+    for sn in seq_pairs: print(f" {sn[:col_w]:>{col_w}}", end='')
+    print(f" {'avg':>{col_w}}")
+    print("  " + "-" * (6 + 32 + col_w * (len(seq_pairs)+1) + 2))
+
+    csv_rows = []
     for cfg in configs:
         per_seq: Dict[str, Dict] = {}
         for sn, sp in seq_pairs.items():
-            # evaluate_config が PoseAUC@20 を返すよう修正されている前提
             m = evaluate_config(cfg['xfeat'], cfg['matcher'], sp, device,
                                 args.n_eval_pairs, args.max_kp, args.inlier_thr)
             per_seq[sn] = m
 
-        # 指標キーの定義 (PoseAUC@20を追加)
-        keys = ['MS', 'Prec@3px', 'PoseAUC@5', 'PoseAUC@10', 'PoseAUC@20']
-        avg = {k: float(np.mean([v[k] for v in per_seq.values()])) for k in keys}
+        keys = ['MS', 'Prec@3px', 'PoseAUC@5', 'PoseAUC@10']
+        avg  = {k: float(np.mean([v[k] for v in per_seq.values()])) for k in keys}
         avg['n_match'] = float(np.mean([v['n_match'] for v in per_seq.values()]))
         cfg['per_seq'] = per_seq
         cfg['metrics'] = avg
 
-    # ── [修正点] シーケンスごとの個別テーブル表示 ──────────────────────────
-    # 表示したい指標とラベル、スケーリングの定義
-    metrics_display = [
-        ('PoseAUC@5',  'AUC@5(%)',  100),
-        ('PoseAUC@10', 'AUC@10(%)', 100),
-        ('PoseAUC@20', 'AUC@20(%)', 100),
-        ('Prec@3px',   'Precision', 100)
-    ]
+        # 表示（PoseAUC@5 行）
+        row = f"  {'AUC@5':<6} {cfg['name']:<32}"
+        for sn in seq_pairs:
+            row += f" {per_seq[sn]['PoseAUC@5']*100:>{col_w}.1f}%"
+        row += f" {avg['PoseAUC@5']*100:>{col_w}.1f}%"
+        print(row)
 
-    target_seqs = list(seq_pairs.keys()) + ['avg']
+        # CSV
+        for sn, m in per_seq.items():
+            csv_rows.append({'Config': cfg['name'], 'Seq': sn,
+                'MS(%)': round(m['MS']*100, 2),
+                'Prec@3px(%)': round(m['Prec@3px']*100, 2),
+                'n_match': round(m['n_match'], 0),
+                'PoseAUC@5(%)': round(m['PoseAUC@5']*100, 2),
+                'PoseAUC@10(%)': round(m['PoseAUC@10']*100, 2)})
+        csv_rows.append({'Config': cfg['name'], 'Seq': 'avg',
+            'MS(%)': round(avg['MS']*100, 2),
+            'Prec@3px(%)': round(avg['Prec@3px']*100, 2),
+            'n_match': round(avg['n_match'], 0),
+            'PoseAUC@5(%)': round(avg['PoseAUC@5']*100, 2),
+            'PoseAUC@10(%)': round(avg['PoseAUC@10']*100, 2)})
 
-    for sn in target_seqs:
-        print(f"\n【Sequence: {sn}】")
-        header = f"{'Model Configuration':<40} | " + " | ".join([f"{m[1]:>12}" for m in metrics_display])
-        print("-" * len(header))
-        print(header)
-        print("-" * len(header))
-
-        for cfg in configs:
-            data = cfg['per_seq'][sn] if sn != 'avg' else cfg['metrics']
-            row = [f"{data.get(k, 0)*s:>12.2f}" for k, _, s in metrics_display]
-            print(f"{cfg['name']:<40} | " + " | ".join(row))
-        print("-" * len(header))
-
-    # ── CSV保存 (PoseAUC@20を含む) ──────────────────────────────────────
     if args.save_csv:
         csv_path = os.path.join(args.output_dir, 'metrics.csv')
-        import csv
-        with open(csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Config', 'Seq', 'MS(%)', 'Prec(%)', 'PoseAUC@5', 'PoseAUC@10', 'PoseAUC@20'])
-            for cfg in configs:
-                for sn in target_seqs:
-                    d = cfg['per_seq'][sn] if sn != 'avg' else cfg['metrics']
-                    writer.writerow([cfg['name'], sn, d['MS']*100, d['Prec@3px']*100, 
-                                     d['PoseAUC@5']*100, d['PoseAUC@10']*100, d['PoseAUC@20']*100])
-        print(f"\n  CSV保存: {csv_path}")
+        with open(csv_path, 'w') as f:
+            f.write('Config,Seq,MS(%),Prec@3px(%),n_match,'
+                    'PoseAUC@5(%),PoseAUC@10(%)\n')
+            for r in csv_rows:
+                f.write(f"{r['Config']},{r['Seq']},{r['MS(%)']},"
+                        f"{r['Prec@3px(%)']},"
+                        f"{r['n_match']},{r['PoseAUC@5(%)']},"
+                        f"{r['PoseAUC@10(%)']}\n")
+        print(f"\n  CSV 保存: {csv_path}")
 
-    # ── 可視化 (進捗表示付き) ──────────────────────────────────────────
+    # ── 可視化 ────────────────────────────────────────────────────────
     if args.save_vis:
-        print(f"\n[可視化開始] {args.n_vis_pairs} ペア × {len(seq_pairs)} シーケンス")
+        print(f"\n[可視化] {args.n_vis_pairs} ペア × {len(seq_pairs)} シーケンス")
         for sn, sp in seq_pairs.items():
             seq_dir = os.path.join(args.output_dir, sn)
             os.makedirs(seq_dir, exist_ok=True)
-            n_target = min(len(sp), args.n_vis_pairs)
-            for i, (p0, p1, T_rel_t, K_t) in enumerate(sp[:n_target]):
-                if (i + 1) % 5 == 0 or (i + 1) == n_target:
-                    print(f"    - {sn}: ({i+1}/{n_target}) 枚目の画像を生成中...")
+            print(f"  [{sn}]")
+            for i, (p0, p1, T_rel_t, K_t) in enumerate(sp[:args.n_vis_pairs]):
+                T_rel = np.array(T_rel_t, dtype=np.float64)
+                K     = np.array(K_t,     dtype=np.float64)
                 for cfg in configs:
                     cfg['metrics'] = cfg['per_seq'][sn]
-                visualize_pair(configs, p0, p1, np.array(T_rel_t), np.array(K_t), 
-                               os.path.join(seq_dir, f'pair_{i:03d}.png'),
+                out = os.path.join(seq_dir, f'pair_{i:03d}.png')
+                visualize_pair(configs, p0, p1, T_rel, K, out,
                                args.max_kp, args.inlier_thr, device)
-    
-    print(f"\n{'='*60}\n  評価完了 -> {args.output_dir}/\n{'='*60}")
+
+    print(f"\n{'='*60}")
+    print(f"  評価完了  →  {args.output_dir}/")
+    print(f"{'='*60}")
 
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@ from kornia.feature.lightglue import LightGlue
 from torch import nn
 import torch
 import os
+import unittest.mock as mock
 
 class LighterGlue(nn.Module):
     """
@@ -28,19 +29,23 @@ class LighterGlue(nn.Module):
 
     def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../weights/xfeat-lighterglue.pt'):
         super().__init__()
+        
+        # --- Kornia >= 0.7.x の厳密なキーチェックを回避 ---
+        if hasattr(LightGlue, 'features') and 'xfeat' not in LightGlue.features:
+            LightGlue.features['xfeat'] = self.default_conf_xfeat
+        
         LightGlue.default_conf = self.default_conf_xfeat
-        self.net = LightGlue('xfeat')
+        
+        # --- Kornia の自動ダウンロード(404エラー)をモックで一時的に無効化 ---
+        with mock.patch('torch.hub.load_state_dict_from_url') as mock_load:
+            mock_load.return_value = {}
+            self.net = LightGlue('xfeat')
+
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # if os.path.exists(weights):
-        #     state_dict = torch.load(weights, map_location=self.dev)
-        # else:
-        #     state_dict = torch.hub.load_state_dict_from_url("https://github.com/verlab/accelerated_features/raw/main/weights/xfeat-lighterglue.pt")
         if os.path.exists(weights):
-            # PyTorch 2.4+ のセキュリティ仕様に合わせて weights_only=True を追加
             state_dict = torch.load(weights, map_location=self.dev, weights_only=True)
         else:
-            # torch.hub.load_state_dict_from_url の場合も念のため追加を推奨
             state_dict = torch.hub.load_state_dict_from_url(
                 "https://github.com/verlab/accelerated_features/raw/main/weights/xfeat-lighterglue.pt", 
                 weights_only=True

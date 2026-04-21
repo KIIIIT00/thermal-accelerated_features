@@ -14,7 +14,7 @@
 data:
   sthereo_root:      "datasets/sthereo"
   vivid_root:        "datasets/vivid"
-  # ms2_root:          "datasets/ms2"   # MS2 追加（雨天・夜間・天候多様性）
+  ms2_root:          "datasets/ms2"   # MS2 追加（雨天・夜間・天候多様性）
   split:             "all"
   max_pairs_per_seq: 2000
   eval_n_pairs:      200           # 統計的信頼性: SE=sqrt(p(1-p)/200)≈3.5pt
@@ -24,7 +24,7 @@ data:
   skip_initial_eval: true          # 初回評価をスキップ
 
 augmentation:
-  enabled:       false
+  enabled:       true
   p_flip:        0.5             # 水平反転
   p_brightness:  0.5             # 輝度シフト
   p_contrast:    0.5             # コントラスト変動
@@ -42,7 +42,7 @@ augmentation:
 # 根拠: kd_only が最良（rep/geo 損失は PoseAUC -22.4pt の劣化）
 stage1:
   name:        "kd_pretrain"
-  output:      "checkpoints/pipeline/stage1_kd"
+  output:      "checkpoints/pipeline/stage1_kd_ms2_aug"
   epochs:      100
   batch_size:  32                   # GPU 余裕あり（旧 16 から増加）
   lr:          1.0e-4
@@ -67,7 +67,7 @@ stage1:
 #       E行列5点法には画像全体への KP 分散が必須
 stage2:
   name:        "spatial_diversity"
-  output:      "checkpoints/pipeline/stage2_spatial"
+  output:      "checkpoints/pipeline/stage2_spatial_ms2_aug"
   epochs:      50
   batch_size:  32                   # GPU 余裕あり
   lr:          5.0e-5               # Stage1 の 1/2（過学習防止）
@@ -81,7 +81,7 @@ stage2:
     lambda_spatial:   0.1           # NEW: KP 空間分散（4×4 grid entropy）
     lambda_thermal:   0.05          # NEW: 温度境界への KP 誘導
 
-  weights_init: "checkpoints/pipeline/stage1_kd_proposed/best.pth"
+  weights_init: "checkpoints/pipeline/stage1_kd_ms2_aug_proposed/best.pth"
 
 # ── Stage 3: LightGlue 再 fine-tune ─────────────────────────────────────────
 # 目的: Stage2 の記述子変化に LG を再適応（Recall の回復）
@@ -89,7 +89,7 @@ stage2:
 # データ: SThErEO のみ（VIVID の GT 精度が LOAM のため LG 学習には不適）
 stage3:
   name:        "lg_readapt"
-  output:      "checkpoints/pipeline/stage3_lg_spatial"
+  output:      "checkpoints/pipeline/stage3_lg_spatial_aug"
   n_steps:     26000    # 10 epoch 相当（SThErEO 2619 steps/ep × 10）
   epochs:      40       # fallback（n_steps が優先）
   lr:          1.0e-5   # 論文 Appendix C.4: fine-tuning lr=1e-5

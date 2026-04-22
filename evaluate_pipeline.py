@@ -702,6 +702,159 @@ def load_matcher(matcher_path: Optional[str], device: torch.device) -> Optional[
 # 1ペアのマッチング
 # ---------------------------------------------------------------------------
 
+def resize_with_pad(img: np.ndarray, target_size: Tuple[int, int] = (640, 480)) -> Tuple[np.ndarray, Tuple[float, float, int, int]]:
+    """
+    アスペクト比を維持してリサイズし、黒でパディングする (Letterbox)。
+    戻り値: パディング済み画像, (スケールX, スケールY, pad_x, pad_y)
+    """
+    h, w = img.shape[:2]
+    tw, th = target_size
+    scale = min(tw / w, th / h)
+    
+    nw, nh = int(w * scale), int(h * scale)
+    img_resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    
+    pad_w = tw - nw
+    pad_h = th - nh
+    top, bottom = pad_h // 2, pad_h - (pad_h // 2)
+    left, right = pad_w // 2, pad_w - (pad_w // 2)
+    
+    img_padded = cv2.copyMakeBorder(img_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+    
+    # 座標を元に戻すための情報を返す
+    return img_padded, (w / nw, h / nh, left, top)
+    
+# @torch.no_grad()
+# def run_matching(
+#     xfeat:   torch.nn.Module,
+#     matcher: Optional[object],
+#     img0:    np.ndarray,
+#     img1:    np.ndarray,
+#     max_kp:  int,
+#     device:  torch.device,
+# ) -> Tuple[np.ndarray, np.ndarray]:
+#     from eval.eval_matching import detect, match
+
+#     H, W  = img0.shape[:2]
+#     size  = (640, 480)
+#     img0r = cv2.resize(img0, size)
+#     img1r = cv2.resize(img1, size)
+
+#     def to_tensor(im):
+#         im3 = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
+#         return (torch.from_numpy(im3)
+#                 .permute(2, 0, 1).float().div(255)
+#                 .unsqueeze(0).to(device))
+
+#     t0 = to_tensor(img0r)
+#     t1 = to_tensor(img1r)
+
+#     kpts0, descs0 = detect(xfeat, t0, max_kp)
+#     kpts1, descs1 = detect(xfeat, t1, max_kp)
+
+#     if len(kpts0) == 0 or len(kpts1) == 0:
+#         return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
+
+#     if matcher is None:
+#         idx0, idx1 = match(descs0, descs1, 'mutual_nn', ratio_thr=0.9)
+#     else:
+#         if matcher.__class__.__name__ == 'LighterGlue':
+#             kpts0_t = torch.from_numpy(kpts0).unsqueeze(0).to(device)
+#             descs0_t = torch.from_numpy(descs0).unsqueeze(0).to(device)
+#             size0_t = torch.tensor([[size[0], size[1]]], device=device)
+            
+#             kpts1_t = torch.from_numpy(kpts1).unsqueeze(0).to(device)
+#             descs1_t = torch.from_numpy(descs1).unsqueeze(0).to(device)
+#             size1_t = torch.tensor([[size[0], size[1]]], device=device)
+
+#             data = {
+#                 'keypoints0': kpts0_t,
+#                 'descriptors0': descs0_t,
+#                 'image_size0': size0_t,
+#                 'keypoints1': kpts1_t,
+#                 'descriptors1': descs1_t,
+#                 'image_size1': size1_t,
+#             }
+            
+#             res = matcher(data)
+#             if 'matches' in res:
+#                 m = res['matches'][0].cpu().numpy()
+#                 idx0 = m[:, 0].astype(np.int64)
+#                 idx1 = m[:, 1].astype(np.int64)
+#             elif 'matches0' in res:
+#                 m = res['matches0'][0].cpu().numpy()
+#                 valid = m >= 0
+#                 idx0 = np.where(valid)[0]
+#                 idx1 = m[valid]
+#             else:
+#                 idx0, idx1 = match(descs0, descs1, 'mutual_nn', ratio_thr=0.9)
+#         else:
+#             from eval.eval_matching import match_lightglue
+#             idx0, idx1 = match_lightglue(
+#                 kpts0, descs0, kpts1, descs1,
+#                 image_size=(size[1], size[0]),
+#                 device=device,
+#                 lightglue_model=matcher
+#             )
+
+#     if len(idx0) == 0:
+#         return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
+
+#     sx = W / size[0]
+#     sy = H / size[1]
+#     m0 = kpts0[idx0].copy(); m0[:, 0] *= sx; m0[:, 1] *= sy
+#     m1 = kpts1[idx1].copy(); m1[:, 0] *= sx; m1[:, 1] *= sy
+
+#     return m0.astype(np.float32), m1.astype(np.float32)
+
+def read_image_for_eval(path: str) -> np.ndarray:
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+
+    if 'ms2' in path.lower() or 'sync_data' in path.lower():
+        img_float = img.astype(np.float32)
+        if img_float.ndim == 3:
+            img_float = cv2.cvtColor(img_float, cv2.COLOR_BGR2GRAY)
+            
+        # 1. AnyThermal方式の hist_99 正規化
+        im_srt = np.sort(img_float.reshape(-1))
+        upper_bound = im_srt[round(len(im_srt) * 0.99) - 1]
+        lower_bound = im_srt[round(len(im_srt) * 0.01)]
+
+        img_float[img_float < lower_bound] = lower_bound
+        img_float[img_float > upper_bound] = upper_bound
+        
+        if upper_bound - lower_bound > 1e-5:
+            image_out = ((img_float - lower_bound) / (upper_bound - lower_bound)) * 255.0
+        else:
+            image_out = img_float * 0
+            
+        image_out = image_out.astype(np.uint8)
+
+        # 2. AnyThermal方式の enhance_image (CLAHE + Bilateral)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_img = clahe.apply(image_out)
+        img_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
+        
+        # 3. 【最重要】AnyThermal方式の Crop (静的ノイズ領域の除去)
+        h, w = img_final.shape[:2]
+        crop_top, crop_bottom = 9, 35
+        crop_left, crop_right = 28, 34
+        img_final = img_final[crop_top:h - crop_bottom, crop_left:w - crop_right]
+        
+    else:
+        # SThErEO等の処理済みデータセット用
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if img.dtype == np.uint16:
+            img_uint8 = (img / 256).astype(np.uint8)
+        else:
+            img_uint8 = img.astype(np.uint8)
+        img_final = img_uint8
+
+    return img_final
+
 @torch.no_grad()
 def run_matching(
     xfeat:   torch.nn.Module,
@@ -713,16 +866,14 @@ def run_matching(
 ) -> Tuple[np.ndarray, np.ndarray]:
     from eval.eval_matching import detect, match
 
-    H, W  = img0.shape[:2]
-    size  = (640, 480)
-    img0r = cv2.resize(img0, size)
-    img1r = cv2.resize(img1, size)
+    # --- 修正: アスペクト比を維持したリサイズ＆パディング ---
+    size = (640, 480)
+    img0r, meta0 = resize_with_pad(img0, size)
+    img1r, meta1 = resize_with_pad(img1, size)
 
     def to_tensor(im):
         im3 = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
-        return (torch.from_numpy(im3)
-                .permute(2, 0, 1).float().div(255)
-                .unsqueeze(0).to(device))
+        return (torch.from_numpy(im3).permute(2, 0, 1).float().div(255).unsqueeze(0).to(device))
 
     t0 = to_tensor(img0r)
     t1 = to_tensor(img1r)
@@ -740,48 +891,38 @@ def run_matching(
             kpts0_t = torch.from_numpy(kpts0).unsqueeze(0).to(device)
             descs0_t = torch.from_numpy(descs0).unsqueeze(0).to(device)
             size0_t = torch.tensor([[size[0], size[1]]], device=device)
-            
             kpts1_t = torch.from_numpy(kpts1).unsqueeze(0).to(device)
             descs1_t = torch.from_numpy(descs1).unsqueeze(0).to(device)
             size1_t = torch.tensor([[size[0], size[1]]], device=device)
-
-            data = {
-                'keypoints0': kpts0_t,
-                'descriptors0': descs0_t,
-                'image_size0': size0_t,
-                'keypoints1': kpts1_t,
-                'descriptors1': descs1_t,
-                'image_size1': size1_t,
-            }
-            
+            data = {'keypoints0': kpts0_t, 'descriptors0': descs0_t, 'image_size0': size0_t,
+                    'keypoints1': kpts1_t, 'descriptors1': descs1_t, 'image_size1': size1_t}
             res = matcher(data)
             if 'matches' in res:
                 m = res['matches'][0].cpu().numpy()
-                idx0 = m[:, 0].astype(np.int64)
-                idx1 = m[:, 1].astype(np.int64)
+                idx0, idx1 = m[:, 0].astype(np.int64), m[:, 1].astype(np.int64)
             elif 'matches0' in res:
                 m = res['matches0'][0].cpu().numpy()
                 valid = m >= 0
-                idx0 = np.where(valid)[0]
-                idx1 = m[valid]
+                idx0, idx1 = np.where(valid)[0], m[valid]
             else:
                 idx0, idx1 = match(descs0, descs1, 'mutual_nn', ratio_thr=0.9)
         else:
             from eval.eval_matching import match_lightglue
-            idx0, idx1 = match_lightglue(
-                kpts0, descs0, kpts1, descs1,
-                image_size=(size[1], size[0]),
-                device=device,
-                lightglue_model=matcher
-            )
+            idx0, idx1 = match_lightglue(kpts0, descs0, kpts1, descs1, image_size=(size[1], size[0]), device=device, lightglue_model=matcher)
 
     if len(idx0) == 0:
         return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
 
-    sx = W / size[0]
-    sy = H / size[1]
-    m0 = kpts0[idx0].copy(); m0[:, 0] *= sx; m0[:, 1] *= sy
-    m1 = kpts1[idx1].copy(); m1[:, 0] *= sx; m1[:, 1] *= sy
+    # --- 修正: パディングとスケールを考慮して元の画像座標に逆変換 ---
+    m0 = kpts0[idx0].copy()
+    sx0, sy0, pad_x0, pad_y0 = meta0
+    m0[:, 0] = (m0[:, 0] - pad_x0) * sx0
+    m0[:, 1] = (m0[:, 1] - pad_y0) * sy0
+
+    m1 = kpts1[idx1].copy()
+    sx1, sy1, pad_x1, pad_y1 = meta1
+    m1[:, 0] = (m1[:, 0] - pad_x1) * sx1
+    m1[:, 1] = (m1[:, 1] - pad_y1) * sy1
 
     return m0.astype(np.float32), m1.astype(np.float32)
 
@@ -851,8 +992,10 @@ def evaluate_config(
         T_rel = np.array(T_rel_t, dtype=np.float64)
         K     = np.array(K_t,     dtype=np.float64)
 
-        img0 = cv2.imread(path0, cv2.IMREAD_GRAYSCALE)
-        img1 = cv2.imread(path1, cv2.IMREAD_GRAYSCALE)
+        # img0 = cv2.imread(path0, cv2.IMREAD_GRAYSCALE)
+        # img1 = cv2.imread(path1, cv2.IMREAD_GRAYSCALE)
+        img0 = read_image_for_eval(path0)
+        img1 = read_image_for_eval(path1)
         if img0 is None or img1 is None:
             continue
 
@@ -933,6 +1076,66 @@ def draw_matches(
                 cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
     return canvas
 
+# _DEBUG_MS2_SAVE_COUNT = 5
+def read_image_for_eval(path: str) -> np.ndarray:
+    """評価パイプライン専用の画像読み込み関数"""
+    global _DEBUG_MS2_SAVE_COUNT
+    
+    # 1. 16-bit 情報を保持して読み込む
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+
+    # MS2 の場合のみ特別な前処理を適用
+    if 'ms2' in path.lower() or 'sync_data' in path.lower():
+        img_float = img.astype(np.float32)
+        if img_float.ndim == 3:
+            img_float = cv2.cvtColor(img_float, cv2.COLOR_BGR2GRAY)
+            
+        im_srt = np.sort(img_float.reshape(-1))
+        upper_bound = im_srt[round(len(im_srt) * 0.99) - 1]
+        lower_bound = im_srt[round(len(im_srt) * 0.01)]
+
+        img_float[img_float < lower_bound] = lower_bound
+        img_float[img_float > upper_bound] = upper_bound
+        
+        if upper_bound - lower_bound > 1e-5:
+            image_out = ((img_float - lower_bound) / (upper_bound - lower_bound)) * 255.0
+        else:
+            image_out = img_float * 0
+            
+        image_out = image_out.astype(np.uint8)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_img = clahe.apply(image_out)
+        img_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
+
+        h, w = img_final.shape[:2]
+        crop_top, crop_bottom = 9, 35
+        crop_left, crop_right = 28, 34
+        img_final = img_final[crop_top:h - crop_bottom, crop_left:w - crop_right]
+
+        # ----------------------------------------------------------
+        # # デバッグ用：前処理が完了した画像を最初の10枚だけディスクに保存
+        # if _DEBUG_MS2_SAVE_COUNT < 10:
+        #     import os
+        #     save_dir = "debug_ms2_eval"
+        #     os.makedirs(save_dir, exist_ok=True)
+        #     original_name = os.path.basename(path)
+        #     save_path = os.path.join(save_dir, f"eval_prep_{_DEBUG_MS2_SAVE_COUNT:02d}_{original_name}")
+        #     cv2.imwrite(save_path, img_final)
+        #     print(f"[DEBUG] MS2前処理確認用画像を保存しました: {save_path}")
+        #     _DEBUG_MS2_SAVE_COUNT += 1
+        # ----------------------------------------------------------
+        return img_final
+
+    else:
+        # SThErEO や VIVID など既に前処理済みのデータセット用
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if img.dtype == np.uint16:
+            return (img / 256).astype(np.uint8)
+        return img.astype(np.uint8)
 
 def visualize_pair(
     configs:  List[Dict],
@@ -945,8 +1148,10 @@ def visualize_pair(
     inlier_thr: float,
     device:   torch.device,
 ) -> None:
-    img0 = cv2.imread(path0, cv2.IMREAD_GRAYSCALE)
-    img1 = cv2.imread(path1, cv2.IMREAD_GRAYSCALE)
+    # img0 = cv2.imread(path0, cv2.IMREAD_GRAYSCALE)
+    # img1 = cv2.imread(path1, cv2.IMREAD_GRAYSCALE)
+    img0 = read_image_for_eval(path0)
+    img1 = read_image_for_eval(path1)
     if img0 is None or img1 is None:
         return
 

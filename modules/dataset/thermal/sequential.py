@@ -68,9 +68,9 @@ def _relative_pose(T_a: np.ndarray, T_b: np.ndarray) -> np.ndarray:
 # TartanRGBT の thermal_left カメラ内部パラメータ（論文記載値）
 # 実際は sequence ごとの calib.yaml を参照することが望ましい
 _TARTANRGBT_K_DEFAULT = np.array([
-    [320.0,   0.0, 320.0],
-    [  0.0, 320.0, 256.0],
-    [  0.0,   0.0,   1.0],
+    [421.23237248, 0.0,          317.55165969],
+    [0.0,          420.80872096, 255.54588954],
+    [0.0,          0.0,          1.0         ]
 ], dtype=np.float64)
 
 # Freiburg thermal の近似内部パラメータ（文献値）
@@ -84,7 +84,6 @@ _FREIBURG_K_THERMAL = np.array([
 # ---------------------------------------------------------------------------
 # TartanRGBT シーケンスデータセット
 # ---------------------------------------------------------------------------
-
 class TartanRGBTSequentialDataset(Dataset):
     """
     TartanRGBT の連続フレームペア + 相対姿勢データセット。
@@ -120,9 +119,13 @@ class TartanRGBTSequentialDataset(Dataset):
 
         for seq_dir in sorted(seq_dirs):
             thr_dir    = os.path.join(seq_dir, 'thermal_left_rect_8')
-            pose_path  = os.path.join(seq_dir, 'pose_left_rect.txt')
             ffc_path   = os.path.join(seq_dir, 'thermal_left_ffc', 'data.txt')
             calib_path = os.path.join(seq_dir, 'calib.yaml')
+            
+            # 【修正ポイント2】正しい姿勢ファイルのパス (odometry/poses.npy)
+            odom_path  = os.path.join(seq_dir, 'stereo_depth', 'poses.npy')
+            print(f"\n--- [DEBUG] Checking sequence: {seq_dir} ---")
+            print(f"  odom_path exists?: {os.path.isfile(odom_path)}")
 
             if not os.path.isdir(thr_dir):
                 continue
@@ -142,15 +145,39 @@ class TartanRGBTSequentialDataset(Dataset):
             if len(thr_files) < 2:
                 continue
 
-            # 姿勢ファイル
+            # 【修正ポイント3】poses.npy のロード処理
             poses: Optional[List[np.ndarray]] = None
-            if os.path.isfile(pose_path):
+            if os.path.isfile(odom_path):
                 try:
-                    raw = np.loadtxt(pose_path)
-                    if raw.ndim == 2 and raw.shape[1] == 7:
-                        poses = [_pose_vec_to_mat(row) for row in raw]
-                except Exception:
-                    pass
+                    # np.load で .npy ファイルを読み込む
+                    raw_poses = np.load(odom_path)
+                    print(f"\n--- DEBUG: {seq_dir} ---")
+                    print(f"raw_poses.shape: {raw_poses.shape}")
+                    print(f"raw_poses[0]: {raw_poses[0]}")
+
+                    ts_path = os.path.join(seq_dir, 'target_timestamps.txt')
+                    if os.path.isfile(ts_path):
+                        with open(ts_path) as f:
+                            ts_lines = f.readlines()
+                        print(f"target_timestamps lines: {len(ts_lines)}")
+                    else:
+                        print("target_timestamps.txt NOT FOUND!")
+                        
+                    print(f"thermal images count: {len(thr_files)}")
+                    print("--------------------------\n")
+                    poses = []
+                    for row in raw_poses:
+                        # TartanRGBTのposes.npyは [tx, ty, tz, qx, qy, qz, qw] の7要素
+                        # (万が一タイムスタンプが含まれる8要素の場合は row[1:8] を取得)
+                        if len(row) == 7:
+                            pose_vec = row
+                        elif len(row) >= 8:
+                            pose_vec = row[1:8]
+                        else:
+                            continue
+                        poses.append(_pose_vec_to_mat(pose_vec))
+                except Exception as e:
+                    print(f"[SeqTartanRGBT] Failed to load poses.npy in {seq_dir}: {e}")
 
             # カメラ行列
             K = _TARTANRGBT_K_DEFAULT.copy()
@@ -179,6 +206,10 @@ class TartanRGBTSequentialDataset(Dataset):
                 T_rel = np.eye(4, dtype=np.float64)
                 if poses and i < len(poses) and j < len(poses):
                     T_rel = _relative_pose(poses[i], poses[j])
+                    
+                    # 【修正ポイント4】並進移動が 0.1m 未満（ホバリング・静止状態）ならペアから除外
+                    if np.linalg.norm(T_rel[:3, 3]) < 0.1:
+                        continue
 
                 self._pairs.append((tp_t, tp_t1, T_rel, K))
                 count += 1
@@ -188,7 +219,6 @@ class TartanRGBTSequentialDataset(Dataset):
             if count > 0:
                 seq_name = os.path.basename(seq_dir)
                 print(f"  {seq_name}: {count} pairs (pose={'✓' if poses else '×'})")
-
     @staticmethod
     def _find_seq_dirs(data_root: str,
                        splits_dir: Optional[str]) -> List[str]:
@@ -264,6 +294,189 @@ class TartanRGBTSequentialDataset(Dataset):
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+    
+# class TartanRGBTSequentialDataset(Dataset):
+#     """
+#     TartanRGBT の連続フレームペア + 相対姿勢データセット。
+
+#     Args:
+#         data_root:   TARTANRGBT_ROOT
+#         splits_dir:  sequence.yaml が置かれたディレクトリ（None → data_root/splits/）
+#         stride:      フレーム間隔（1=直接隣接フレーム）
+#         max_pairs_per_seq: シーケンスあたりの最大ペア数（メモリ節約）
+#     """
+
+#     def __init__(
+#         self,
+#         data_root: str,
+#         splits_dir: Optional[str] = None,
+#         stride: int = 5,
+#         max_pairs_per_seq: int = 500,
+#     ):
+#         self.data_root = data_root
+#         self.stride    = stride
+
+#         self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
+
+#         # splits_dir が未設定の場合は AnyThermal の公式パスを優先する
+#         if splits_dir is None:
+#             anythermal_splits = os.path.join(
+#                 'third_party', 'anythermal',
+#                 'custom_datasets', 'tartanRGBT', 'splits')
+#             splits_dir = anythermal_splits if os.path.isdir(anythermal_splits) else None
+
+#         seq_dirs = self._find_seq_dirs(data_root, splits_dir)
+#         print(f"[SeqTartanRGBT] {len(seq_dirs)} sequences found")
+
+#         for seq_dir in sorted(seq_dirs):
+#             thr_dir    = os.path.join(seq_dir, 'thermal_left_rect_8')
+#             pose_path  = os.path.join(seq_dir, 'pose_left_rect.txt')
+#             ffc_path   = os.path.join(seq_dir, 'thermal_left_ffc', 'data.txt')
+#             calib_path = os.path.join(seq_dir, 'calib.yaml')
+
+#             if not os.path.isdir(thr_dir):
+#                 continue
+
+#             # FFC フレーム除外
+#             ffc_set: set = set()
+#             if os.path.isfile(ffc_path):
+#                 with open(ffc_path) as f:
+#                     for idx_l, line in enumerate(f):
+#                         if line.strip() == '1':
+#                             ffc_set.add(idx_l)
+
+#             thr_files = sorted(
+#                 f for f in os.listdir(thr_dir)
+#                 if f.lower().endswith(('.png', '.jpg'))
+#             )
+#             if len(thr_files) < 2:
+#                 continue
+
+#             # 姿勢ファイル
+#             poses: Optional[List[np.ndarray]] = None
+#             if os.path.isfile(pose_path):
+#                 try:
+#                     raw = np.loadtxt(pose_path)
+#                     if raw.ndim == 2 and raw.shape[1] == 7:
+#                         poses = [_pose_vec_to_mat(row) for row in raw]
+#                 except Exception:
+#                     pass
+
+#             # カメラ行列
+#             K = _TARTANRGBT_K_DEFAULT.copy()
+#             if os.path.isfile(calib_path):
+#                 try:
+#                     with open(calib_path) as f:
+#                         calib = yaml.safe_load(f)
+#                     if isinstance(calib, dict) and 'thermal_left' in calib:
+#                         km = calib['thermal_left'].get('K', None)
+#                         if km:
+#                             K = np.array(km, dtype=np.float64).reshape(3, 3)
+#                 except Exception:
+#                     pass
+
+#             count = 0
+#             for i in range(len(thr_files) - stride):
+#                 j = i + stride
+#                 if i in ffc_set or j in ffc_set:
+#                     continue
+
+#                 tp_t  = os.path.join(thr_dir, thr_files[i])
+#                 tp_t1 = os.path.join(thr_dir, thr_files[j])
+#                 if not (os.path.isfile(tp_t) and os.path.isfile(tp_t1)):
+#                     continue
+
+#                 T_rel = np.eye(4, dtype=np.float64)
+#                 if poses and i < len(poses) and j < len(poses):
+#                     T_rel = _relative_pose(poses[i], poses[j])
+#                     # 並進移動が 0.1m 未満ならペアとして採用しない
+#                     if np.linalg.norm(T_rel[:3, 3]) < 0.1:
+#                         continue
+
+#                 self._pairs.append((tp_t, tp_t1, T_rel, K))
+#                 count += 1
+#                 if count >= max_pairs_per_seq:
+#                     break
+
+#             if count > 0:
+#                 seq_name = os.path.basename(seq_dir)
+#                 print(f"  {seq_name}: {count} pairs (pose={'✓' if poses else '×'})")
+
+#     @staticmethod
+#     def _find_seq_dirs(data_root: str,
+#                        splits_dir: Optional[str]) -> List[str]:
+#         """
+#         thermal_left_rect_8 ディレクトリを持つシーケンスを収集する。
+#         sequence.yaml がある場合はそれを優先する。
+#         """
+#         # sequence.yaml を探す
+#         for sd in [splits_dir, os.path.join(data_root, 'splits')]:
+#             if sd and os.path.isfile(os.path.join(sd, 'sequence.yaml')):
+#                 try:
+#                     with open(os.path.join(sd, 'sequence.yaml')) as f:
+#                         seq_map = yaml.safe_load(f)
+#                     traj_map = seq_map.get('traj_list', seq_map)
+#                     dirs = []
+#                     for key, label in traj_map.items():
+#                         if not isinstance(label, str):
+#                             continue
+#                         day_prefix = key.split('/')[0]
+#                         seq_dir = os.path.join(data_root, day_prefix, label)
+#                         if not os.path.isdir(seq_dir):
+#                             seq_dir = os.path.join(data_root, key)
+#                         if os.path.isdir(seq_dir):
+#                             dirs.append(seq_dir)
+#                     if dirs:
+#                         return dirs
+#                 except Exception:
+#                     pass
+
+#         # sequence.yaml がない → directory walk で探す
+#         # TartanRGBT の構造:
+#         #   data_root/
+#         #     {scene_name}/
+#         #       thermal_left_rect_8/   ← このディレクトリがあればシーケンス
+#         #       pose_left_rect.txt
+#         result = []
+#         for name in os.listdir(data_root):
+#             d = os.path.join(data_root, name)
+#             if not os.path.isdir(d):
+#                 continue
+#             # 直下に thermal_left_rect_8 がある場合
+#             if os.path.isdir(os.path.join(d, 'thermal_left_rect_8')):
+#                 result.append(d)
+#                 continue
+#             # 1階層下に thermal_left_rect_8 がある場合
+#             for sub in os.listdir(d):
+#                 sd = os.path.join(d, sub)
+#                 if os.path.isdir(sd) and os.path.isdir(
+#                         os.path.join(sd, 'thermal_left_rect_8')):
+#                     result.append(sd)
+#         return result
+
+#     def __len__(self) -> int:
+#         return len(self._pairs)
+
+#     def __getitem__(self, idx: int) -> Dict[str, Tensor]:
+#         tp_t, tp_t1, T_rel, K = self._pairs[idx]
+#         thr_t  = self._read_thr(tp_t)
+#         thr_t1 = self._read_thr(tp_t1)
+#         return {
+#             'thr_t'  : thr_t,
+#             'thr_t1' : thr_t1,
+#             'T_rel'  : torch.from_numpy(T_rel).float(),
+#             'K'      : torch.from_numpy(K).float(),
+#             'valid'  : torch.tensor(True),
+#         }
+
+#     @staticmethod
+#     def _read_thr(path: str) -> Tensor:
+#         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+#         if img is None:
+#             raise FileNotFoundError(f"[SeqTartanRGBT] not found: {path}")
+#         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+#         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+#         return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
 
 # ---------------------------------------------------------------------------
@@ -539,11 +752,23 @@ class SThErEOSequentialDataset(Dataset):
 
             # stride ペアを構築
             n_added = 0
+            # for i in range(0, len(matched) - stride, stride):
+            #     j = i + stride
+            #     p_t,  T_t  = matched[i]
+            #     p_t1, T_t1 = matched[j]
+            #     T_rel = np.linalg.inv(T_t) @ T_t1
+            #     self._pairs.append((p_t, p_t1, T_rel, K))
             for i in range(0, len(matched) - stride, stride):
                 j = i + stride
                 p_t,  T_t  = matched[i]
                 p_t1, T_t1 = matched[j]
                 T_rel = np.linalg.inv(T_t) @ T_t1
+                
+                # --- ここを 0.01 から 0.5 に変更 ---
+                if np.linalg.norm(T_rel[:3, 3]) < 0.5:
+                    continue
+                # -----------------------------------
+                
                 self._pairs.append((p_t, p_t1, T_rel, K))
                 n_added += 1
                 if n_added >= max_pairs_per_seq:
@@ -809,11 +1034,23 @@ class VividSequentialDataset(Dataset):
 
                 # stride ペアを構築
                 n_added = 0
+                # for i in range(0, len(matched) - stride, stride):
+                #     j = i + stride
+                #     p_t,  T_t  = matched[i]
+                #     p_t1, T_t1 = matched[j]
+                #     T_rel = np.linalg.inv(T_t) @ T_t1
+                #     self._pairs.append((p_t, p_t1, T_rel, K))
                 for i in range(0, len(matched) - stride, stride):
                     j = i + stride
                     p_t,  T_t  = matched[i]
                     p_t1, T_t1 = matched[j]
                     T_rel = np.linalg.inv(T_t) @ T_t1
+
+                    # --- ここを 0.01 から 0.5 に変更 ---
+                    if np.linalg.norm(T_rel[:3, 3]) < 0.5:
+                        continue
+                    # -----------------------------------
+
                     self._pairs.append((p_t, p_t1, T_rel, K))
                     n_added += 1
                     if n_added >= max_pairs_per_seq:
@@ -1035,18 +1272,45 @@ _MS2_VAL_SEQS = [
 ]
 
 
+# def _load_ms2_frame_pose(pose_txt: str) -> Optional[np.ndarray]:
+#     """
+#     MS2 の 1フレーム分の pose ファイルを読み込む。
+
+#     実際のデータ構造:
+#         odom/{seq}/thr/{idx:06d}.txt  ← フレームごとに個別ファイル
+#         例: 000668.txt → frame 668 の pose
+
+#     形式を自動判別:
+#         16値: 4×4 変換行列（row-major, 同次座標）
+#         12値: 3×4 変換行列（row-major, KITTI 形式）
+#          7値: tx ty tz qx qy qz qw（quaternion 形式）
+#     """
+#     if not os.path.isfile(pose_txt):
+#         return None
+#     try:
+#         with open(pose_txt) as f:
+#             raw = f.read()
+#         vals = list(map(float, raw.strip().split()))
+#     except (ValueError, OSError):
+#         return None
+
+#     T = np.eye(4, dtype=np.float64)
+#     if len(vals) == 16:
+#         T = np.array(vals, dtype=np.float64).reshape(4, 4)
+#     elif len(vals) == 12:
+#         T[:3, :4] = np.array(vals, dtype=np.float64).reshape(3, 4)
+#     elif len(vals) == 7:
+#         tx, ty, tz, qx, qy, qz, qw = vals
+#         T[:3, :3] = _quat_to_rot(qx, qy, qz, qw)
+#         T[:3,  3] = [tx, ty, tz]
+#     else:
+#         return None
+
+#     return T
+
 def _load_ms2_frame_pose(pose_txt: str) -> Optional[np.ndarray]:
     """
     MS2 の 1フレーム分の pose ファイルを読み込む。
-
-    実際のデータ構造:
-        odom/{seq}/thr/{idx:06d}.txt  ← フレームごとに個別ファイル
-        例: 000668.txt → frame 668 の pose
-
-    形式を自動判別:
-        16値: 4×4 変換行列（row-major, 同次座標）
-        12値: 3×4 変換行列（row-major, KITTI 形式）
-         7値: tx ty tz qx qy qz qw（quaternion 形式）
     """
     if not os.path.isfile(pose_txt):
         return None
@@ -1071,6 +1335,27 @@ def _load_ms2_frame_pose(pose_txt: str) -> Optional[np.ndarray]:
 
     return T
 
+def _load_ms2_K(calib_path: str) -> np.ndarray:
+    """
+    MS2の calib.npy から Thermal Left カメラの内部パラメータ (K_thrL) を読み込む。
+    calib.npy が見つからない場合のみデフォルト値にフォールバックする。
+    """
+    if os.path.isfile(calib_path):
+        try:
+            # .npy が辞書として保存されているため allow_pickle=True でロード
+            calib_data = np.load(calib_path, allow_pickle=True).item()
+            if 'K_thrL' in calib_data:
+                K_matrix = np.array(calib_data['K_thrL'], dtype=np.float64).reshape(3, 3)
+                return K_matrix
+            else:
+                print(f"[MS2Seq] Warning: 'K_thrL' が {calib_path} 内に見つかりません。")
+        except Exception as e:
+            print(f"[MS2Seq] Warning: {calib_path} の読み込みに失敗しました ({e})")
+    else:
+        print(f"[MS2Seq] Warning: キャリブレーションファイル {calib_path} が見つかりません。")
+        
+    # 失敗した時のみデフォルトを使用
+    return _MS2_K_DEFAULT.copy()
 
 class MS2SequentialDataset(Dataset):
     """
@@ -1158,16 +1443,30 @@ class MS2SequentialDataset(Dataset):
                 continue
 
             # stride でペアを構築
-            K = _MS2_K_DEFAULT.copy()
+            calib_path = os.path.join(sync_root, seq_name, 'calib.npy')
+            K = _load_ms2_K(calib_path)
+
             n_added = 0
+            # for i in range(0, len(matched) - stride, stride):
+            #     j = i + stride
+            #     p_t,  T_t  = matched[i]
+            #     p_t1, T_t1 = matched[j]
+            #     T_rel = np.linalg.inv(T_t) @ T_t1
+            #     if np.linalg.norm(T_rel[:3, 3]) < 0.01:
+            #         continue
+            #     # 読み込んだK行列をペア情報として保存
+            #     self._pairs.append((p_t, p_t1, T_rel, K))
             for i in range(0, len(matched) - stride, stride):
                 j = i + stride
                 p_t,  T_t  = matched[i]
                 p_t1, T_t1 = matched[j]
                 T_rel = np.linalg.inv(T_t) @ T_t1
-                # 移動量が極めて小さい（静止）ペアを除外
-                if np.linalg.norm(T_rel[:3, 3]) < 0.01:
+                
+                # --- ここを 0.01 から 0.5 に変更 ---
+                if np.linalg.norm(T_rel[:3, 3]) < 0.5:
                     continue
+                # -----------------------------------
+                
                 self._pairs.append((p_t, p_t1, T_rel, K))
                 n_added += 1
                 if n_added >= max_pairs_per_seq:
@@ -1188,23 +1487,71 @@ class MS2SequentialDataset(Dataset):
             'valid'  : torch.tensor(True),
         }
 
+    global _DEBUG_MS2_SAVE_COUNT
+    _DEBUG_MS2_SAVE_COUNT = 10
+
     def _read_thr(self, path: str) -> Tensor:
-        """
-        熱画像を読み込む。
-        MS2 は hist_99 前処理済みのため、オプションで CLAHE を追加適用。
-        SThErEO との前処理統一のため apply_clahe=True を推奨。
-        """
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        global _DEBUG_MS2_SAVE_COUNT
+        
+        # 1. RAW読み込み (8-bitダウンキャストを防ぎ、16-bit等の生データを保持)
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
-            raise FileNotFoundError(path)
+            raise FileNotFoundError(f"[MS2Seq] not found: {path}")
 
-        if self.apply_clahe:
-            # SThErEO との前処理統一: CLAHE を追加適用
-            # clipLimit をランダム化して多様なコントラストをカバー
-            clip = float(np.random.uniform(*self.clahe_clip_range))
-            clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
-            img = clahe.apply(img)
+        img_float = img.astype(np.float32)
+        if img_float.ndim == 3:
+            img_float = cv2.cvtColor(img_float, cv2.COLOR_BGR2GRAY)
+            
+        # ==========================================================
+        # 【正しい前処理 1】 hist_99 (1%〜99%パーセンタイル正規化)
+        # ==========================================================
+        im_srt = np.sort(img_float.reshape(-1))
+        upper_bound = im_srt[round(len(im_srt) * 0.99) - 1]
+        lower_bound = im_srt[round(len(im_srt) * 0.01)]
 
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        img_float[img_float < lower_bound] = lower_bound
+        img_float[img_float > upper_bound] = upper_bound
+        
+        if upper_bound - lower_bound > 1e-5:
+            image_out = ((img_float - lower_bound) / (upper_bound - lower_bound)) * 255.0
+        else:
+            image_out = img_float * 0
+            
+        image_out = image_out.astype(np.uint8)
+
+        # ==========================================================
+        # 【正しい前処理 2】 enhance_image (CLAHE + Bilateral Filter)
+        # ==========================================================
+        # MS2の評価時は、パラメータをランダム化せず AnyThermal 固定値を使用
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_img = clahe.apply(image_out)
+        # ノイズを平滑化しつつエッジを保持
+        img_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
+
+        # ==========================================================
+        # 【正しい前処理 3】 crop (静的ノイズ領域：自車の枠の切り抜き)
+        # ==========================================================
+        h, w = img_final.shape[:2]
+        crop_top, crop_bottom = 9, 35
+        crop_left, crop_right = 28, 34
+        img_final = img_final[crop_top:h - crop_bottom, crop_left:w - crop_right]
+
+        # ----------------------------------------------------------
+        # デバッグ用：前処理が完了した画像を最初の10枚だけディスクに保存
+        # ----------------------------------------------------------
+        if _DEBUG_MS2_SAVE_COUNT < 10:
+            save_dir = "debug_ms2_preprocessed"
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # 元のファイル名を取得して保存名にする
+            original_name = os.path.basename(path)
+            save_path = os.path.join(save_dir, f"prep_{_DEBUG_MS2_SAVE_COUNT:02d}_{original_name}")
+            
+            cv2.imwrite(save_path, img_final)
+            print(f"[DEBUG] MS2前処理確認用画像を保存しました: {save_path}")
+            _DEBUG_MS2_SAVE_COUNT += 1
+        # ----------------------------------------------------------
+
+        # XFeatに入力するため、3チャンネル化してテンソル(0.0~1.0)に変換
+        img_final = cv2.cvtColor(img_final, cv2.COLOR_GRAY2RGB)
+        return torch.from_numpy(img_final).permute(2, 0, 1).float() / 255.0

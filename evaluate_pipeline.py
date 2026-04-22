@@ -1290,6 +1290,7 @@ def main():
     matcher_rgb  = load_matcher(args.matcher_rgb, device)
 
     print("\n[Config B] XFeat(Therm)+ Matcher(RGB)")
+    print(f"DEBUG: Loading Thermal XFeat from {args.xfeat_therm}")
     xfeat_therm  = load_xfeat(args.xfeat_therm, device)
 
     print("\n[Config C] XFeat(RGB)  + Matcher(Therm)")

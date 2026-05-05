@@ -65,6 +65,59 @@ def _relative_pose(T_a: np.ndarray, T_b: np.ndarray) -> np.ndarray:
     return np.linalg.inv(T_b) @ T_a
 
 
+def _load_dual_tensor(self, path: str, dataset_type: str) -> dict:
+    """
+    14/16-bit Raw と 8-bit 前処理画像をペアで読み込む共通メソッド
+    """
+    # 1. Raw データの読み込み (14/16-bit 保持)
+    img_raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img_raw is None:
+        raise FileNotFoundError(f"File not found: {path}")
+
+    # --- 損失関数用 Raw テンソル ---
+    thr_raw = torch.from_numpy(img_raw.astype(np.float32)).unsqueeze(0)
+
+    # --- ネットワーク入力用 8-bit 前処理 (ドメインごとに分岐) ---
+    if dataset_type == 'ms2':
+        # evaluate_pipeline.py と同等の高品質前処理
+        v_min, v_max = np.percentile(img_raw, [0.5, 99.5])
+        img_8bit = np.clip((img_raw - v_min) / (v_max - v_min + 1e-6) * 255, 0, 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        img_8bit = clahe.apply(img_8bit)
+        img_8bit = cv2.bilateralFilter(img_8bit, 5, 20, 15)
+        # 静的ノイズのクロップ (自車のボンネット等)
+        h, w = img_8bit.shape[:2]
+        img_8bit = img_8bit[9:h-35, 28:w-34]
+        thr_raw = thr_raw[:, 9:h-35, 28:w-34]
+    else:
+        # 他のデータセット (デフォルトの 8-bit 変換)
+        img_8bit = (img_raw >> (self.bit_depth - 8)).astype(np.uint8) if self.bit_depth > 8 else img_raw.astype(np.uint8)
+
+    thr_8bit = torch.from_numpy(img_8bit).unsqueeze(0).float() / 255.0
+
+    return {'8bit': thr_8bit, 'raw': thr_raw}
+
+def apply_synced_spatial_transform(img_dict, transform_fn=None):
+    """
+    8-bitとRawテンソルに全く同じ空間的データ拡張を適用するためのヘルパー。
+    （※元のパイプラインに外部のtransformがある場合を想定）
+    """
+    if transform_fn is None:
+        return img_dict
+    
+    # 現在の乱数シード状態を保存
+    rng_state = torch.get_rng_state()
+    
+    # 8-bitに適用
+    img_8bit = transform_fn(img_dict['8bit'])
+    
+    # まったく同じ乱数状態でRawに適用（空間変形のみ）
+    torch.set_rng_state(rng_state)
+    img_raw = transform_fn(img_dict['raw'])
+    
+    return {'8bit': img_8bit, 'raw': img_raw}
+
+
 # TartanRGBT の thermal_left カメラ内部パラメータ（論文記載値）
 # 実際は sequence ごとの calib.yaml を参照することが望ましい
 _TARTANRGBT_K_DEFAULT = np.array([
@@ -293,7 +346,10 @@ class TartanRGBTSequentialDataset(Dataset):
             raise FileNotFoundError(f"[SeqTartanRGBT] not found: {path}")
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+        tensor_img = torch.from_numpy(img).permute(2, 0, 1).float() /255.0
+        _, orig_h, orig_w = tensor_img.shape
+        return tensor_img, torch.tensor([orig_h, orig_w])
     
 # class TartanRGBTSequentialDataset(Dataset):
 #     """
@@ -482,17 +538,9 @@ class TartanRGBTSequentialDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Freiburg シーケンスデータセット（姿勢なし近似）
 # ---------------------------------------------------------------------------
-
 class FreiburgSequentialDataset(Dataset):
     """
-    Freiburg の連続フレームペアデータセット。
-    厳密な姿勢情報がないため valid=False を返し、
-    Stage 2 では基本行列（F行列）によるエピポーラ損失のみを使用する。
-
-    Args:
-        data_root:  FREIBURG_ROOT
-        splits_dir: frame_list txt が置かれたディレクトリ（None → data_root/splits/frame_list/）
-        stride:     フレーム間隔
+    Freiburg の連続フレームペアデータセット (サブフォルダ階層自動パース対応版)
     """
 
     def __init__(
@@ -504,57 +552,222 @@ class FreiburgSequentialDataset(Dataset):
     ):
         self.data_root = data_root
         self.stride    = stride
-        thr_dir = os.path.join(data_root, 'thermal8_clahe')
-        splits_dir = splits_dir or os.path.join(data_root, 'splits', 'frame_list')
-
+        
+        if splits_dir is None:
+            splits_dir = 'third_party/anythermal/custom_datasets/freiburg/splits/frame_list'
+        self.splits_dir = splits_dir
+        
         _VAL_PREFIXES = ('train_seq_01_night', 'train_seq_02_day')
-
         self._pairs: List[Tuple[str, str]] = []
 
-        if not os.path.isdir(splits_dir):
-            return
+        if not os.path.isdir(self.splits_dir):
+            raise FileNotFoundError(f"🚨 splits_dir が見つかりません: {self.splits_dir}")
 
-        for txt_name in sorted(os.listdir(splits_dir)):
-            if not txt_name.endswith('.txt'):
-                continue
+        for txt_name in sorted(os.listdir(self.splits_dir)):
+            if not txt_name.endswith('.txt'): continue
+            
             stem = txt_name[:-4]
             is_val = any(stem.startswith(p) for p in _VAL_PREFIXES)
-            if (split == 'val') != is_val:
+            if (split == 'val') != is_val: continue
+
+            # 例: 'train_seq_04_day_07' -> 'seq_04_day_07'
+            seq_name_pure = stem.replace('train_', '').replace('test_', '')
+
+            # 🎯 修正の核心: 'seq_04_day_07' を 'seq_04_day' と '07' に分解する
+            parts = seq_name_pure.rsplit('_', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                seq_base = parts[0] # 'seq_04_day'
+                seq_sub = parts[1]  # '07'
+            else:
+                seq_base = seq_name_pure
+                seq_sub = ""
+
+            # 物理的に 'train' と 'test' の両方をチェック
+            seq_root = None
+            for parent in ['train', 'test']:
+                # 例: datasets/freiburg/train/seq_04_day/07
+                if seq_sub:
+                    candidate = os.path.join(data_root, parent, seq_base, seq_sub)
+                else:
+                    candidate = os.path.join(data_root, parent, seq_base)
+                
+                if os.path.isdir(candidate):
+                    seq_root = candidate
+                    break  # 見つかったら確定
+
+            if seq_root is None:
+                print(f"⚠️ [スキップ] ディレクトリが存在しません: {seq_base}/{seq_sub}")
                 continue
 
-            with open(os.path.join(splits_dir, txt_name)) as f:
+            # followlinks=True でシンボリックリンクの奥まで強制探索
+            thermal_dirs = []
+            for root, dirs, files in os.walk(seq_root, followlinks=True):
+                if os.path.basename(root) == 'thermal8_clahe':
+                    thermal_dirs.append(root)
+
+            if len(thermal_dirs) == 0:
+                print(f"⚠️ [警告] {seq_root} の中に 'thermal8_clahe' が見つかりません")
+                continue
+
+            with open(os.path.join(self.splits_dir, txt_name)) as f:
                 frames = [l.strip() for l in f if l.strip()]
 
             for i in range(len(frames) - stride):
                 j = i + stride
-                tp_t  = os.path.join(thr_dir, f'fl_ir_aligned_{frames[i]}.png')
-                tp_t1 = os.path.join(thr_dir, f'fl_ir_aligned_{frames[j]}.png')
-                if os.path.isfile(tp_t) and os.path.isfile(tp_t1):
-                    self._pairs.append((tp_t, tp_t1))
+                
+                f_i = frames[i].replace('.png', '').replace('fl_ir_aligned_', '')
+                f_j = frames[j].replace('.png', '').replace('fl_ir_aligned_', '')
+                
+                candidates_i = [f'fl_ir_aligned_{f_i}.png', f'{f_i}.png', f'fl_ir_{f_i}.png']
+                candidates_j = [f'fl_ir_aligned_{f_j}.png', f'{f_j}.png', f'fl_ir_{f_j}.png']
+                
+                found_pair = False
+                for img_dir in thermal_dirs:
+                    tp_t, tp_t1 = None, None
+                    
+                    for c_i in candidates_i:
+                        if os.path.isfile(os.path.join(img_dir, c_i)):
+                            tp_t = os.path.join(img_dir, c_i)
+                            break
+                            
+                    for c_j in candidates_j:
+                        if os.path.isfile(os.path.join(img_dir, c_j)):
+                            tp_t1 = os.path.join(img_dir, c_j)
+                            break
+                            
+                    if tp_t and tp_t1:
+                        self._pairs.append((tp_t, tp_t1))
+                        found_pair = True
+                        break
+                
+                if i == 0 and not found_pair:
+                    print(f"❌ [致命的エラー] 画像のマッチングに失敗しました！")
+                    print(f"   探索したフォルダ: {thermal_dirs}")
+                    print(f"   探したファイル名の候補: {candidates_i}")
+
+        if len(self._pairs) == 0:
+            raise ValueError(f"🚨 有効な画像ペアが0件です。{self.data_root} の構造を再確認してください。")
 
     def __len__(self) -> int:
         return len(self._pairs)
 
-    def __getitem__(self, idx: int) -> Dict[str, Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         tp_t, tp_t1 = self._pairs[idx]
         thr_t  = self._read_thr(tp_t)
         thr_t1 = self._read_thr(tp_t1)
         return {
             'thr_t'  : thr_t,
             'thr_t1' : thr_t1,
-            'T_rel'  : torch.eye(4).float(),           # 不明 → 単位行列
-            'K'      : torch.from_numpy(_FREIBURG_K_THERMAL).float(),
-            'valid'  : torch.tensor(False),             # 幾何損失は使わない
+            'T_rel'  : torch.eye(4).float(),
+            'K'      : torch.eye(3).float(),
+            'valid'  : torch.tensor(False),
         }
 
     @staticmethod
-    def _read_thr(path: str) -> Tensor:
+    def _read_thr(path: str) -> torch.Tensor:
+        import cv2
+        import torch.nn.functional as F
+        
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise FileNotFoundError(f"[SeqFreiburg] not found: {path}")
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        tensor_img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+        # 元サイズを記録
+        _, orig_h, orig_w = tensor_img.shape
+        
+        # 🎯 解決策: ネットワークがクラッシュしないよう、32の倍数に動的パディング
+        _, h, w = tensor_img.shape
+        pad_h = (32 - (h % 32)) % 32
+        pad_w = (32 - (w % 32)) % 32
+        
+        # 端数が存在する場合のみ、画像の右(pad_w)と下(pad_h)にエッジのピクセルをコピーして拡張
+        if pad_h > 0 or pad_w > 0:
+            tensor_img = F.pad(tensor_img, (0, pad_w, 0, pad_h), mode='replicate')
+            
+        return tensor_img, torch.tensor([orig_h, orig_w])
+
+# class FreiburgSequentialDataset(Dataset):
+#     """
+#     Freiburg の連続フレームペアデータセット。
+#     厳密な姿勢情報がないため valid=False を返し、
+#     Stage 2 では基本行列（F行列）によるエピポーラ損失のみを使用する。
+
+#     Args:
+#         data_root:  FREIBURG_ROOT
+#         splits_dir: frame_list txt が置かれたディレクトリ（None → data_root/splits/frame_list/）
+#         stride:     フレーム間隔
+#     """
+
+#     def __init__(
+#         self,
+#         data_root: str,
+#         splits_dir: Optional[str] = None,
+#         stride: int = 1,
+#         split: str = 'train',
+#     ):
+#         self.data_root = data_root
+#         self.stride    = stride
+#         thr_dir = os.path.join(data_root, 'thermal8_clahe')
+#         # splits_dir = splits_dir or os.path.join("third_party/anythermal/custom_datasets/freiburg", 'splits', 'frame_list')
+#         if splits_dir is None:
+#             splits_dir = 'third_party/anythermal/custom_datasets/freiburg/splits/frame_list'
+        
+#         self.splits_dir = splits_dir
+
+#         _VAL_PREFIXES = ('train_seq_01_night', 'train_seq_02_day')
+
+#         self._pairs: List[Tuple[str, str]] = []
+
+#         if not os.path.isdir(self.splits_dir):
+#             raise FileNotFoundError(f"🚨 splits_dir が見つかりません: {self.splits_dir}")
+
+#         for txt_name in sorted(os.listdir(splits_dir)):
+#             if not txt_name.endswith('.txt'):
+#                 continue
+#             stem = txt_name[:-4]
+#             is_val = any(stem.startswith(p) for p in _VAL_PREFIXES)
+#             if (split == 'val') != is_val:
+#                 continue
+
+#             with open(os.path.join(splits_dir, txt_name)) as f:
+#                 frames = [l.strip() for l in f if l.strip()]
+
+#             for i in range(len(frames) - stride):
+#                 j = i + stride
+#                 tp_t  = os.path.join(thr_dir, f'fl_ir_aligned_{frames[i]}.png')
+#                 tp_t1 = os.path.join(thr_dir, f'fl_ir_aligned_{frames[j]}.png')
+#                 if i == 0 and "seq_00" in txt_name:
+#                     print(f"🔍 [Debug] 探しているパス: {tp_t}")
+#                     print(f"🔍 [Debug] 存在するか？: {os.path.isfile(tp_t)}")
+#                 if os.path.isfile(tp_t) and os.path.isfile(tp_t1):
+#                     self._pairs.append((tp_t, tp_t1))
+
+#     def __len__(self) -> int:
+#         return len(self._pairs)
+
+#     def __getitem__(self, idx: int) -> Dict[str, Tensor]:
+#         tp_t, tp_t1 = self._pairs[idx]
+#         thr_t  = self._read_thr(tp_t)
+#         thr_t1 = self._read_thr(tp_t1)
+#         return {
+#             'thr_t'  : thr_t,
+#             'thr_t1' : thr_t1,
+#             'T_rel'  : torch.eye(4).float(),           # 不明 → 単位行列
+#             'K'      : torch.from_numpy(_FREIBURG_K_THERMAL).float(),
+#             'valid'  : torch.tensor(False),             # 幾何損失は使わない
+#         }
+
+#     @staticmethod
+#     def _read_thr(path: str) -> Tensor:
+#         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+#         if img is None:
+#             raise FileNotFoundError(f"[SeqFreiburg] not found: {path}")
+#         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+#         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+#         return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
 
 # ===========================================================================
@@ -796,19 +1009,68 @@ class SThErEOSequentialDataset(Dataset):
             raise FileNotFoundError(path)
         img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR),
                            cv2.COLOR_BGR2RGB)
-        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        
+        tensor_img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        _, orig_h, orig_w = tensor_img.shape
+        
+        return tensor_img, torch.tensor([orig_h, orig_w])
 
 
 # ===========================================================================
 # VIVID シーケンスデータセット
 # ===========================================================================
 
-_VIVID_K_DEFAULT = np.array([
-    [463.34, 0.0,   320.85],
-    [0.0,   463.34, 254.37],
-    [0.0,     0.0,    1.0 ],
+# ---------------------------------------------------------
+# [1] Driving Rig (車載) のキャリブレーション
+# ---------------------------------------------------------
+_VIVID_K_THERMAL_DRIVING = np.array([
+    [445.34173838383924, 0., 310.74708274781557],
+    [0., 446.40695195454197, 249.54892754326676],
+    [0., 0., 1.]
 ], dtype=np.float64)
 
+_T_LIDAR_RGB_DRIVING = np.array([
+    [-0.0270616227044768,  0.0190319829239477, -0.999452576264919, -0.041734828640527],
+    [ 0.999632057148236,  -0.00133414427822033, -0.0270918877273367,  0.381819951839073],
+    [-0.00184902628058047, -0.999817985277834, -0.0189888761327854, -0.387926814385318],
+    [ 0., 0., 0., 1.]
+], dtype=np.float64)
+
+_T_THER_RGB_DRIVING = np.array([
+    [ 0.9999542456699035,   0.009560428122585098, -0.0003236987046896138, -0.08091328937864654],
+    [-0.009551247501964968, 0.99972273548858,      0.02152268148700763,    0.009867919648358975],
+    [ 0.000529375003888239,-0.02151860500468971,  0.999768307859757,     -0.010521750729036269],
+    [ 0., 0., 0., 1.]
+], dtype=np.float64)
+
+_T_LIDAR_THER_DRIVING = _T_LIDAR_RGB_DRIVING @ _T_THER_RGB_DRIVING
+_T_THER_LIDAR_DRIVING = np.linalg.inv(_T_LIDAR_THER_DRIVING)
+
+# ---------------------------------------------------------
+# [2] Handheld Rig (手持ち) のキャリブレーション
+# ---------------------------------------------------------
+_VIVID_K_THERMAL_HANDHELD = np.array([
+    [437.38861083256637, 0., 323.5284494924228],
+    [0., 437.29475745770907, 256.36315482047905],
+    [0., 0., 1.]
+], dtype=np.float64)
+
+_T_RGB_GT_HANDHELD = np.array([
+    [ 0.973885611349115,  0.219949561445752, -0.056293928864320, -0.0117440966714135],
+    [-0.0138573065904114,-0.189900928293333, -0.981705461168161, -0.149850241232451],
+    [-0.226615955001450,  0.956848905445970, -0.181893873139337, -0.111478544432891],
+    [ 0., 0., 0., 1.]
+], dtype=np.float64)
+
+_T_RGB_THER_HANDHELD = np.array([
+    [ 0.9999117397341355,   0.002936303473050537,  0.012957270691089122,  0.02284737993266349],
+    [-0.002938371484737371, 0.999995673097488,     0.00014056782332314203,-0.04897547901167786],
+    [-0.012956801876454241,-0.00017862869148840368,0.9999160411639161,    0.033484737180487244],
+    [ 0., 0., 0., 1.]
+], dtype=np.float64)
+
+_T_GT_THER_HANDHELD = _T_RGB_GT_HANDHELD @ _T_RGB_THER_HANDHELD
+_T_THER_GT_HANDHELD = np.linalg.inv(_T_GT_THER_HANDHELD)
 
 def _quat_to_rot(qx: float, qy: float,
                  qz: float, qw: float) -> np.ndarray:
@@ -963,9 +1225,7 @@ class VividSequentialDataset(Dataset):
         # → 2段階でシーケンスを列挙する
 
         # カテゴリ一覧を取得（driving_full, driving_vision 等）
-        categories = sorted(
-            c for c in os.listdir(extracted)
-            if os.path.isdir(os.path.join(extracted, c)))
+        categories = sorted(c for c in os.listdir(extracted) if os.path.isdir(os.path.join(extracted, c)))
 
         if not categories:
             print(f"[VividSeq] no categories found in {extracted}")
@@ -976,158 +1236,183 @@ class VividSequentialDataset(Dataset):
 
             for seq_name in sorted(os.listdir(cat_dir)):
                 seq_dir = os.path.join(cat_dir, seq_name)
-                if not os.path.isdir(seq_dir):
-                    continue
+                if not os.path.isdir(seq_dir): continue
 
                 is_val = self._VAL_PATTERN in seq_name.lower()
-                if split == 'train' and is_val:
-                    continue
-                if split == 'val' and not is_val:
-                    continue
+                if split == 'train' and is_val: continue
+                if split == 'val' and not is_val: continue
 
-                # 熱画像ディレクトリを探す
-                # 実際のパス: img/thermal_raw/ または thermal/ 等
                 thr_dir = None
                 for cand in [
-                    os.path.join('img', 'thermal_clahe'),  # VIVID: CLAHE 強調（SThErEO と同手法）
-                    os.path.join('img', 'thermal_8'),       # VIVID: 8bit 正規化
-                    os.path.join('img', 'thermal_raw'),     # VIVID: 生データ
-                    'thermal', 'thermal8', 'thermal8_clahe', 'ir',
+                    os.path.join('img', 'thermal_clahe'), os.path.join('img', 'thermal_8'), 
+                    os.path.join('img', 'thermal_raw'), 'thermal', 'thermal8', 'thermal8_clahe', 'ir',
                 ]:
                     d = os.path.join(seq_dir, cand)
-                    if os.path.isdir(d):
-                        pngs = [f for f in os.listdir(d) if f.endswith('.png')]
-                        if pngs:
-                            thr_dir = d
-                            break
+                    if os.path.isdir(d) and [f for f in os.listdir(d) if f.endswith('.png')]:
+                        thr_dir = d; break
 
-                if thr_dir is None:
-                    # 再帰的にサブディレクトリを探す（最大2段）
-                    for sub in os.listdir(seq_dir):
-                        sub_d = os.path.join(seq_dir, sub)
-                        if not os.path.isdir(sub_d):
-                            continue
-                        pngs = [f for f in os.listdir(sub_d)
-                                if f.endswith('.png')]
-                        if pngs:
-                            thr_dir = sub_d
-                            break
+                if thr_dir is None: continue
 
-                if thr_dir is None:
-                    continue
+                img_files = sorted(f for f in os.listdir(thr_dir) if f.endswith('.png'))
+                if len(img_files) < 2: continue
 
-                img_files = sorted(f for f in os.listdir(thr_dir)
-                                   if f.endswith('.png'))
-                if len(img_files) < 2:
-                    continue
-
-                # GT ポーズを探す（category 情報も渡す）
-                poses_t, K = self._get_gt(data_root, seq_name, category)
+                # 🌟 修正1: _get_gt は (poses, K行列, リグタイプ) の3つを返す
+                poses_t, K, rig_type = self._get_gt(data_root, seq_name, category)
                 if not poses_t:
-                    print(f"[VividSeq] {category}/{seq_name}: no GT pose → skip")
                     continue
 
-                # 画像とポーズを対応付け
                 matched = self._match(thr_dir, img_files, poses_t)
-                if len(matched) < 2:
-                    continue
+                if len(matched) < 2: continue
 
-                # stride ペアを構築
                 n_added = 0
-                # for i in range(0, len(matched) - stride, stride):
-                #     j = i + stride
-                #     p_t,  T_t  = matched[i]
-                #     p_t1, T_t1 = matched[j]
-                #     T_rel = np.linalg.inv(T_t) @ T_t1
-                #     self._pairs.append((p_t, p_t1, T_rel, K))
                 for i in range(0, len(matched) - stride, stride):
                     j = i + stride
-                    p_t,  T_t  = matched[i]
-                    p_t1, T_t1 = matched[j]
-                    T_rel = np.linalg.inv(T_t) @ T_t1
+                    p_t,  T_t_raw  = matched[i]
+                    p_t1, T_t1_raw = matched[j]
+                    
+                    # 相対姿勢の計算
+                    T_rel = np.linalg.inv(T_t_raw) @ T_t1_raw
+                    
+                    # 🌟 修正2: リグの種類に応じた、完璧な相似変換の適用
+                    if rig_type == 'driving':
+                        T_rel = _T_THER_LIDAR_DRIVING @ T_rel @ _T_LIDAR_THER_DRIVING
+                    elif rig_type == 'handheld':
+                        T_rel = _T_THER_GT_HANDHELD @ T_rel @ _T_GT_THER_HANDHELD
+                    else:
+                        continue # 万が一不明なリグなら安全のためスキップ
 
-                    # --- ここを 0.01 から 0.5 に変更 ---
+                    # 移動量ガード（変換後のカメラ軌跡で判定）
                     if np.linalg.norm(T_rel[:3, 3]) < 0.5:
                         continue
-                    # -----------------------------------
 
                     self._pairs.append((p_t, p_t1, T_rel, K))
                     n_added += 1
                     if n_added >= max_pairs_per_seq:
                         break
 
-                print(f"[VividSeq] {category}/{seq_name}: "
-                      f"{n_added} pairs (stride={stride})")
+                print(f"[VividSeq] {category}/{seq_name}: {n_added} pairs (Rig: {rig_type})")
+                
+    # @staticmethod
+    # def _get_gt(
+    #     data_root: str,
+    #     seq_name:  str,
+    #     category:  str = '',
+    # ) -> Tuple[List[Tuple[float, np.ndarray]], np.ndarray]:
+    #     K = _VIVID_K_DEFAULT.copy()
+
+    #     # extracted_data/{category}/{seq_name} 内に loampose があれば優先
+    #     # 例: extracted_data/driving_full/campus_day1/loampose/
+    #     cat_seq_loam = os.path.join(
+    #         data_root, 'extracted_data', category, seq_name, 'loampose')
+    #     if os.path.isdir(cat_seq_loam):
+    #         for fname in sorted(os.listdir(cat_seq_loam)):
+    #             if not fname.endswith('_poses.txt') and not fname.endswith('.txt'):
+    #                 continue
+    #             times_cands = ['times.txt', 'time.txt',
+    #                            fname.replace('_poses.txt', '_times.txt')]
+    #             for tc in times_cands:
+    #                 times_path = os.path.join(cat_seq_loam, tc)
+    #                 if os.path.isfile(times_path):
+    #                     poses = _load_vivid_loam_poses(
+    #                         os.path.join(cat_seq_loam, fname), times_path)
+    #                     if poses:
+    #                         return poses, K
+
+    #     # 1. handheld_indoor mocap GT
+    #     indoor_dir = os.path.join(data_root, 'handheld_indoor', 'pose')
+    #     if os.path.isdir(indoor_dir):
+    #         for fname in sorted(os.listdir(indoor_dir)):
+    #             stem = fname.replace('_gt.csv', '').replace('.csv', '')
+    #             if stem in seq_name or seq_name in stem:
+    #                 poses = _load_vivid_indoor_gt(
+    #                     os.path.join(indoor_dir, fname))
+    #                 if poses:
+    #                     return poses, K
+
+    #     # 2. driving LOAM
+    #     loam_dir = os.path.join(data_root, 'driving_full', 'loampose')
+    #     if os.path.isdir(loam_dir):
+    #         for fname in sorted(os.listdir(loam_dir)):
+    #             if not fname.endswith('_poses.txt'):
+    #                 continue
+    #             stem = fname.replace('_optimized_poses.txt', '').replace(
+    #                 '_poses.txt', '')
+    #             if stem in seq_name or seq_name.startswith(stem):
+    #                 for times_fname in [
+    #                     stem + '_times.txt', stem + '_time.txt']:
+    #                     times_path = os.path.join(loam_dir, times_fname)
+    #                     if os.path.isfile(times_path):
+    #                         poses = _load_vivid_loam_poses(
+    #                             os.path.join(loam_dir, fname), times_path)
+    #                         if poses:
+    #                             return poses, K
+
+    #     # 3. handheld_outdoor
+    #     outdoor_dir = os.path.join(data_root, 'handheld_outdoor', 'pose')
+    #     if os.path.isdir(outdoor_dir):
+    #         for fname in sorted(os.listdir(outdoor_dir)):
+    #             if not fname.endswith('.csv'):
+    #                 continue
+    #             stem = fname.replace('.csv', '').replace('path_', '')
+    #             if stem in seq_name or seq_name in stem:
+    #                 poses = _load_vivid_indoor_gt(
+    #                     os.path.join(outdoor_dir, fname))
+    #                 if poses:
+    #                     return poses, K
+
+    #     return [], K
 
     @staticmethod
     def _get_gt(
         data_root: str,
         seq_name:  str,
         category:  str = '',
-    ) -> Tuple[List[Tuple[float, np.ndarray]], np.ndarray]:
-        K = _VIVID_K_DEFAULT.copy()
+    ) -> Tuple[List[Tuple[float, np.ndarray]], np.ndarray, str]:
+        
+        # 1. Driving Rig (LOAM) の探査
+        if 'driving' in category.lower():
+            cat_seq_loam = os.path.join(data_root, 'extracted_data', category, seq_name, 'loampose')
+            if os.path.isdir(cat_seq_loam):
+                for fname in sorted(os.listdir(cat_seq_loam)):
+                    if not fname.endswith('_poses.txt') and not fname.endswith('.txt'): continue
+                    for tc in ['times.txt', 'time.txt', fname.replace('_poses.txt', '_times.txt')]:
+                        times_path = os.path.join(cat_seq_loam, tc)
+                        if os.path.isfile(times_path):
+                            poses = _load_vivid_loam_poses(os.path.join(cat_seq_loam, fname), times_path)
+                            if poses: return poses, _VIVID_K_THERMAL_DRIVING.copy(), 'driving'
 
-        # extracted_data/{category}/{seq_name} 内に loampose があれば優先
-        # 例: extracted_data/driving_full/campus_day1/loampose/
-        cat_seq_loam = os.path.join(
-            data_root, 'extracted_data', category, seq_name, 'loampose')
-        if os.path.isdir(cat_seq_loam):
-            for fname in sorted(os.listdir(cat_seq_loam)):
-                if not fname.endswith('_poses.txt') and not fname.endswith('.txt'):
-                    continue
-                times_cands = ['times.txt', 'time.txt',
-                               fname.replace('_poses.txt', '_times.txt')]
-                for tc in times_cands:
-                    times_path = os.path.join(cat_seq_loam, tc)
-                    if os.path.isfile(times_path):
-                        poses = _load_vivid_loam_poses(
-                            os.path.join(cat_seq_loam, fname), times_path)
-                        if poses:
-                            return poses, K
+            loam_dir = os.path.join(data_root, 'driving_full', 'loampose')
+            if os.path.isdir(loam_dir):
+                for fname in sorted(os.listdir(loam_dir)):
+                    if not fname.endswith('_poses.txt'): continue
+                    stem = fname.replace('_optimized_poses.txt', '').replace('_poses.txt', '')
+                    if stem in seq_name or seq_name.startswith(stem):
+                        for tc in [stem + '_times.txt', stem + '_time.txt']:
+                            times_path = os.path.join(loam_dir, tc)
+                            if os.path.isfile(times_path):
+                                poses = _load_vivid_loam_poses(os.path.join(loam_dir, fname), times_path)
+                                if poses: return poses, _VIVID_K_THERMAL_DRIVING.copy(), 'driving'
 
-        # 1. handheld_indoor mocap GT
+        # 2. Handheld Rig (Mocap / SLAM over Mocap framework) の探査
         indoor_dir = os.path.join(data_root, 'handheld_indoor', 'pose')
         if os.path.isdir(indoor_dir):
             for fname in sorted(os.listdir(indoor_dir)):
                 stem = fname.replace('_gt.csv', '').replace('.csv', '')
                 if stem in seq_name or seq_name in stem:
-                    poses = _load_vivid_indoor_gt(
-                        os.path.join(indoor_dir, fname))
-                    if poses:
-                        return poses, K
+                    poses = _load_vivid_indoor_gt(os.path.join(indoor_dir, fname))
+                    if poses: return poses, _VIVID_K_THERMAL_HANDHELD.copy(), 'handheld'
 
-        # 2. driving LOAM
-        loam_dir = os.path.join(data_root, 'driving_full', 'loampose')
-        if os.path.isdir(loam_dir):
-            for fname in sorted(os.listdir(loam_dir)):
-                if not fname.endswith('_poses.txt'):
-                    continue
-                stem = fname.replace('_optimized_poses.txt', '').replace(
-                    '_poses.txt', '')
-                if stem in seq_name or seq_name.startswith(stem):
-                    for times_fname in [
-                        stem + '_times.txt', stem + '_time.txt']:
-                        times_path = os.path.join(loam_dir, times_fname)
-                        if os.path.isfile(times_path):
-                            poses = _load_vivid_loam_poses(
-                                os.path.join(loam_dir, fname), times_path)
-                            if poses:
-                                return poses, K
-
-        # 3. handheld_outdoor
         outdoor_dir = os.path.join(data_root, 'handheld_outdoor', 'pose')
         if os.path.isdir(outdoor_dir):
             for fname in sorted(os.listdir(outdoor_dir)):
-                if not fname.endswith('.csv'):
-                    continue
+                if not fname.endswith('.csv'): continue
                 stem = fname.replace('.csv', '').replace('path_', '')
                 if stem in seq_name or seq_name in stem:
-                    poses = _load_vivid_indoor_gt(
-                        os.path.join(outdoor_dir, fname))
-                    if poses:
-                        return poses, K
+                    poses = _load_vivid_indoor_gt(os.path.join(outdoor_dir, fname))
+                    if poses: return poses, _VIVID_K_THERMAL_HANDHELD.copy(), 'handheld'
 
-        return [], K
+        # 何も見つからなかった場合
+        return [], np.eye(3), 'none'
 
     @staticmethod
     def _match(
@@ -1173,35 +1458,56 @@ class VividSequentialDataset(Dataset):
             # VIVID の問題: 画像が Unix 秒（~1.6e9）だが
             # times.txt が相対秒（~1587）の場合がある
             # → 最初の画像と最近傍 pose の差が 1000s 超ならスケール不一致
+            # stem0 = img_files[0].rsplit('.', 1)[0]
+            # try:
+            #     ts0 = float(stem0)
+            #     min_diff_check = min(abs(ts0 - pt) for pt in p_times)
+            #     scale_ok = min_diff_check < 1000.0  # 1000秒以内ならスケール一致
+            # except Exception:
+            #     scale_ok = False
+
+            # if scale_ok:
+            #     # 通常のタイムスタンプマッチング
+            #     for fname in img_files:
+            #         stem = fname.rsplit('.', 1)[0]
+            #         try:
+            #             ts_sec = float(stem)
+            #         except ValueError:
+            #             continue
+            #         diffs = [abs(ts_sec - pt) for pt in p_times]
+            #         idx   = int(np.argmin(diffs))
+            #         if diffs[idx] < max_dt:
+            #             matched.append((os.path.join(thr_dir, fname), p_Ts[idx]))
             stem0 = img_files[0].rsplit('.', 1)[0]
             try:
                 ts0 = float(stem0)
-                min_diff_check = min(abs(ts0 - pt) for pt in p_times)
-                scale_ok = min_diff_check < 1000.0  # 1000秒以内ならスケール一致
-            except Exception:
-                scale_ok = False
+                # 画像の最初の時間(UNIX)と、ポーズの最初の時間(相対)の差分をオフセットとする
+                time_offset = ts0 - p_times[0]
+                
+                # オフセットが1000秒以上ある場合は、ポーズ側が相対時間であるとみなして補正
+                if abs(time_offset) >= 1000.0:
+                    p_times_aligned = [pt + time_offset for pt in p_times]
+                    # print(f"  [Time Sync] Applied offset +{time_offset:.1f}s to LOAM poses.")
+                else:
+                    p_times_aligned = p_times
 
-            if scale_ok:
-                # 通常のタイムスタンプマッチング
-                for fname in img_files:
-                    stem = fname.rsplit('.', 1)[0]
-                    try:
-                        ts_sec = float(stem)
-                    except ValueError:
-                        continue
-                    diffs = [abs(ts_sec - pt) for pt in p_times]
-                    idx   = int(np.argmin(diffs))
-                    if diffs[idx] < max_dt:
-                        matched.append((os.path.join(thr_dir, fname), p_Ts[idx]))
-            else:
-                # スケール不一致 → インデックスベースマッチング
-                # 画像数 と pose 数 の比率で対応付け
-                n     = min(len(img_files), len(p_Ts))
-                ratio = len(p_Ts) / max(len(img_files), 1)
-                for i in range(n):
-                    pidx = min(int(i * ratio), len(p_Ts) - 1)
-                    matched.append((
-                        os.path.join(thr_dir, img_files[i]), p_Ts[pidx]))
+            except Exception:
+                return []
+
+            # 補正済みのタイムスタンプ (p_times_aligned) を用いて、厳密な時間差マッチングを行う
+            for fname in img_files:
+                stem = fname.rsplit('.', 1)[0]
+                try:
+                    ts_sec = float(stem)
+                except ValueError:
+                    continue
+                # 補正済みのポーズ時間との差分を計算
+                diffs = [abs(ts_sec - pt) for pt in p_times_aligned]
+                idx   = int(np.argmin(diffs))
+                
+                # max_dt (デフォルト0.1秒) 以内のズレしか許容しない
+                if diffs[idx] < max_dt:
+                    matched.append((os.path.join(thr_dir, fname), p_Ts[idx]))
 
         else:
             # 連番インデックスの場合: 等間隔サンプリング
@@ -1479,13 +1785,75 @@ class MS2SequentialDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict:
         p_t, p_t1, T_rel, K = self._pairs[idx]
+
+        # dual thermal tensor
+        data_t  = self._read_dual_thr(p_t)
+        data_t1 = self._read_dual_thr(p_t1)
+
         return {
-            'thr_t'  : self._read_thr(p_t),
-            'thr_t1' : self._read_thr(p_t1),
-            'T_rel'  : torch.from_numpy(T_rel).float(),
-            'K'      : torch.from_numpy(K).float(),
-            'valid'  : torch.tensor(True),
+            'thr_t_8bit': dict_t['8bit'],
+            'thr_t_raw': dict_t['raw'],
+            'thr_t1_8bit': dict_t1['8bit'],
+            'thr_t1_raw': dict_t1['raw'],
+            'T_rel': torch.from_numpy(T_rel).float(),
+            'K': torch.from_numpy(K).float(),
+            'valid': torch.tensor(True),
         }
+
+        # return {
+        #     'thr_t'  : self._read_thr(p_t),
+        #     'thr_t1' : self._read_thr(p_t1),
+        #     'T_rel'  : torch.from_numpy(T_rel).float(),
+        #     'K'      : torch.from_numpy(K).float(),
+        #     'valid'  : torch.tensor(True),
+        # }
+    
+    def _read_dual_thr(self, path: str) -> dict:
+        """MS2: 16-bit Rawを読み込み、動的に黄金の前処理を適用"""
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(f"[MS2Seq] not found: {path}")
+
+        img_float = img.astype(np.float32)
+        if img_float.ndim == 3:
+            img_float = cv2.cvtColor(img_float, cv2.COLOR_BGR2GRAY)
+
+        # 1. 8-bit用の動的前処理 (hist_99)
+        im_srt = np.sort(img_float.reshape(-1))
+        upper_bound = im_srt[round(len(im_srt) * 0.99) - 1]
+        lower_bound = im_srt[round(len(im_srt) * 0.01)]
+
+        img_norm = img_float.copy()
+        img_norm[img_norm < lower_bound] = lower_bound
+        img_norm[img_norm > upper_bound] = upper_bound
+        
+        if upper_bound - lower_bound > 1e-5:
+            image_out = ((img_norm - lower_bound) / (upper_bound - lower_bound)) * 255.0
+        else:
+            image_out = img_norm * 0
+        image_out = image_out.astype(np.uint8)
+
+        # 2. CLAHE + Bilateral
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_img = clahe.apply(image_out)
+        img_8bit_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
+
+        # 3. Static Crop (8-bit と Raw 両方に全く同じCropを適用し空間を同期)
+        h, w = img_float.shape[:2]
+        crop_top, crop_bottom = 9, 35
+        crop_left, crop_right = 28, 34
+        
+        img_8bit_cropped = img_8bit_final[crop_top:h - crop_bottom, crop_left:w - crop_right]
+        img_raw_cropped = img_float[crop_top:h - crop_bottom, crop_left:w - crop_right]
+
+        # テンソル化
+        img_8bit_rgb = cv2.cvtColor(img_8bit_cropped, cv2.COLOR_GRAY2RGB)
+        t_8bit = torch.from_numpy(img_8bit_rgb).permute(2, 0, 1).float() / 255.0
+        
+        # Rawは1チャンネルのまま保持（正規化しない）
+        t_raw = torch.from_numpy(img_raw_cropped).unsqueeze(0).float()
+
+        return {'8bit': t_8bit, 'raw': t_raw}
 
     global _DEBUG_MS2_SAVE_COUNT
     _DEBUG_MS2_SAVE_COUNT = 10
@@ -1555,3 +1923,42 @@ class MS2SequentialDataset(Dataset):
         # XFeatに入力するため、3チャンネル化してテンソル(0.0~1.0)に変換
         img_final = cv2.cvtColor(img_final, cv2.COLOR_GRAY2RGB)
         return torch.from_numpy(img_final).permute(2, 0, 1).float() / 255.0
+    
+    # def _read_dual_thr(self, path: str) -> dict:
+    #     """
+    #     16-bit Rawの読み込みと、8-bit前処理画像の生成を同時に行う
+    #     """
+    #     # 1. 16-bit Raw読み込み (cv2.IMREAD_UNCHANGED が必須)
+    #     img_raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    #     if img_raw is None:
+    #         raise FileNotFoundError(f"[MS2] Thermal not found: {path}")
+
+    #     # --- 損失関数用の Raw テンソル ---
+    #     # 物理的な温度差を維持するため、float32 化してテンソルにする (C, H, W)
+    #     thr_raw = torch.from_numpy(img_raw.astype(np.float32)).unsqueeze(0)
+
+    #     # --- ネットワーク入力用の 8-bit 前処理 (evaluate_pipeline.py 準拠) ---
+    #     # ① hist_99 スケーリング
+    #     v_min, v_max = np.percentile(img_raw, [0.5, 99.5])
+    #     img_8bit = np.clip((img_raw - v_min) / (v_max - v_min + 1e-6) * 255, 0, 255).astype(np.uint8)
+
+    #     # ② CLAHE (局所的なコントラスト強調)
+    #     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    #     img_8bit = clahe.apply(img_8bit)
+
+    #     # ③ Bilateral Filter (エッジ保存平滑化)
+    #     img_8bit = cv2.bilateralFilter(img_8bit, 5, 20, 15)
+
+    #     # ④ 共通の静的ノイズクロップ (自車のボンネット等を排除)
+    #     h, w = img_8bit.shape[:2]
+    #     crop_top, crop_bottom = 9, 35
+    #     crop_left, crop_right = 28, 34
+        
+    #     img_8bit = img_8bit[crop_top:h-crop_bottom, crop_left:w-crop_right]
+    #     # ※重要：Raw側も全く同じ範囲でクロップして座標を同期させる
+    #     thr_raw = thr_raw[:, crop_top:h-crop_bottom, crop_left:w-crop_right]
+
+    #     # 8-bit側のテンソル化と正規化 (0.0 ~ 1.0)
+    #     thr_8bit = torch.from_numpy(img_8bit).unsqueeze(0).float() / 255.0
+
+    #     return {'8bit': thr_8bit, 'raw': thr_raw}

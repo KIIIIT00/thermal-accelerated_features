@@ -28,7 +28,7 @@ models:
     weights: "weights/xfeat.pt"
 
   - name:    "thermal_xfeat_proposed"
-    weights: "checkpoints/post_kd/default/post_kd_s2_final.pth"
+    weights: "checkpoints/hybrid_pipeline/stage1_kd/model_epoch_60.pth"
 
 
 # ── マッチング設定 ────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ min_inliers:   15            # E 行列 RANSAC の最小インライア数
 
 
 # ── 出力 ─────────────────────────────────────────────────────────────────────
-output_dir: "evaluate/vo_results"
+output_dir: "evaluate/vo_results_hybrid_pipeline"
 
 
 # ── システム ─────────────────────────────────────────────────────────────────

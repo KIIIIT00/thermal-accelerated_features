@@ -9,33 +9,51 @@ data:
     sthereo: "datasets/sthereo"
     vivid: "datasets/vivid"
     ms2: "datasets/ms2"
-    tartanrgbt: "datasets/tartanRGBT"
+    # tartanrgbt: "datasets/tartanRGBT"
   seqs:
     sthereo:
       - "kaist_morning"
       - "kaist_afternoon"
       - "kaist_evening"
+      - "snu_morning"
+      - "snu_afternoon"
+      - "snu_evening"
+      - "valley_morning"
+      - "valley_afternoon"
+      - "valley_evening"
     vivid:
       - "driving_full/campus_day1"
       - "driving_full/campus_day2"
+      - "driving_full/campus_evening"
+      - "driving_full/campus_night"
       - "driving_full/city_day1"
-      - "driving_full/urban_day"
-      - "driving_vision/campus_day1"
+      - "driving_full/city_day2"
+      - "driving_full/city_evening"
+      - "driving_full/city_night"
     ms2:
-      - "_2021-08-06-11-23-45"
-    tartanrgbt: [] # 評価しない場合は空リストにするか省略
+      - '_2021-08-06-11-23-45'
+      - '_2021-08-06-16-45-28'
+      - '_2021-08-13-16-14-48'
+      - '_2021-08-13-22-03-03'
+    # tartanrgbt: 
+      # - "day1/indoor_NSH_third_floor"
+      # - "day1/indoor_NSH_fourth_floor"
+      # - "day1/indoor_NSH_first_floor"
+      # - "day1/outdoor_campus_NSH_TO_CUT"
+      # - "day1/outdoor_resedential_SQH_block"
+      # 評価しない場合は空リストにするか省略
   stride:       3                   # フレーム間隔
 
 # ── 評価設定 ─────────────────────────────────────────────────────────────────
 eval:
   n_eval_pairs: 200    # 定量評価（PoseAUC, MS, Prec）に使うペア数
   n_vis_pairs:  100     # 可視化するペア数
-  max_kp:       512    # XFeat の最大キーポイント数
+  max_kp:       1024    # XFeat の最大キーポイント数
   inlier_thr:   3.0    # inlier 判定閾値（px）: 緑/赤の境界
 
 # ── 出力 ─────────────────────────────────────────────────────────────────────
 output:
-  dir:        "results/eval_pipeline_spatial_ms2_rgb"
+  dir:        "results/eval_hybrid_pipeline_epoch60_keypoint1024_FixVIVIDK_STHEREOK"
   save_csv:   true     # metrics.csv を保存
   save_vis:   true     # 可視化画像を保存
 
@@ -49,13 +67,15 @@ output:
 models:
   # XFeat 重み
   xfeat_rgb:   "weights/xfeat.pt"
-  xfeat_therm: "checkpoints/pipeline/stage2_rgb/best.pth"
+  xfeat_therm: "checkpoints/hybrid_pipeline/stage1_kd/model_epoch_60.pth"
+  # xfeat_therm: "checkpoints/KD1_H0_S0_LH5.0_LS90.0/model_epoch_50.pth"
+  # xfeat_therm: "checkpoints/thermal_kd/default/wandb/run-20260405_120228-8st60tz7/files/checkpoints/rel0.1_fpn0.05/thermal_kd_student_80000.pth"
 
   # LightGlue 重み（null = cvg/LightGlue のデフォルト RGB 重みを使用）
   matcher_rgb:   "weights/xfeat-lighterglue.pt"
-  matcher_therm: "checkpoints/pipeline/stage3_lg_rgb/lightglue_ft_final.pth"
+  matcher_therm: "checkpoints/pipeline/stage3_lg_spatial_aug_rgb/lightglue_ft_final.pth"
 
-  compare_pipeline: true
+  compare_pipeline: false
   xfeat_pipe_therm: "checkpoints/pipeline/stage4_rgb/xfeat_joint.pth"
   matcher_pipe_therm: "checkpoints/pipeline/stage4_rgb/lg_joint.pth"
 

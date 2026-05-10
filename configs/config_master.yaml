@@ -1,0 +1,93 @@
+# config_master.yaml
+# ハイブリッド熱画像特徴抽出パイプライン 統合設定ファイル
+
+# ==========================================
+# 共通設定 (Common Settings)
+# ==========================================
+common:
+  device: "0"
+  output_root: "checkpoints/hybrid_pipeline_train_stage2_epoch50"
+  no_wandb: false
+  wandb_project: "thermal-xfeat-hybrid"
+  
+  # データセットのルートパスを一元管理
+  data_roots:
+    sthereo: "datasets/sthereo"
+    vivid: "datasets/vivid"
+    ms2: "datasets/ms2"
+    tartanrgbt: "datasets/tartanRGBT"
+    freiburg: "datasets/freiburg"
+
+# ==========================================
+# Stage 1: 特徴抽出器 KD 学習 (XFeat)
+# ==========================================
+stage1:
+  enabled: true
+  epochs: 100
+  batch_size: 128
+  lr: 1.0e-4
+  
+  # 🔬 アブレーション制御 (Ablation Study)
+  # 損失関数のON/OFFを切り替えて実験可能
+  # 使用するものを trueにする
+  use_kd_loss: true         # KD Loss
+  use_hybrid_loss: true     # 提案する物理勾配Loss
+  use_spatial_loss: false    # 空間分散Loss
+  
+  # 損失の重み (Lambdas)
+  lambda_kd: 0.2
+  lambda_hybrid: 2.0
+  lambda_spatial: 0.0
+  tau_fixed: 200.0          # 16-bit Rawのノイズ閾値
+  
+  # ロギングとデータセット
+  wandb_run_name: "stage1_KD0.2_H2.0_S0.0_removeTartan_Aug"
+  datasets: ["sthereo", "vivid", "ms2", "tartanrgbt", "freiburg"]
+  # datasets: ["sthereo", "vivid", "ms2", "freiburg"]
+  # datasets: ["sthereo", "vivid", "ms2"]
+
+  # 🎯 データ拡張の設定 (Data Augmentation)
+  augmentation:
+    enabled: true
+    crop_size: [256, 256]   # バッチ化のためのRandom Cropサイズ
+    methods:
+      - "flip"              # 左右反転 (空間同期)
+      # - "affine"            # 回転・並進・スケール (空間同期)
+      - "color"             # 輝度・コントラスト (RGB/Thr非同期)
+      # - "cutout"            # 黒塗り欠損 (空間同期)
+
+# ==========================================
+# Stage 2: マッチャーのドメイン適応 (LightGlue FT)
+# ==========================================
+stage2:
+  enabled: true
+  n_steps: 10000
+  batch_size: 32
+  lr: 1.0e-4
+  max_keypoints: 512
+  use_depth_gt: true
+
+  xfeat_weights: "checkpoints/hybrid_pipeline/stage1_kd/model_epoch_60.pth"
+  lg_weights: "weights/xfeat-lighterglue.pt"
+  
+  # ロギングとデータセット (不正確なGTを持つデータを排除)
+  wandb_run_name: "stage2_lightglue_ft_max1024_Kd0.2_H30.0_S0.0_Ms2_Aug_epoch60"
+  # datasets: ["vivid", "ms2"]
+  datasets: ["ms2"]
+
+# ==========================================
+# Stage 3: エンドツーエンド同時学習 (Joint FT)
+# ==========================================
+stage3:
+  enabled: true
+  n_steps: 5000
+  batch_size: 32
+  lr: 1.0e-5               # 記述子ドリフトを防ぐ極小の学習率
+  lambda_match: 0.5
+
+  xfeat_weights: "checkpoints/hybrid_pipeline/stage1_kd/model_epoch_50.pth"
+  lg_weights: "checkpoints/hybrid_pipeline_train_stage2_epoch50/stage2_lightglue/lg_stage2_best.pth"
+  
+  # ロギングとデータセット (最高品質のGTのみに厳選)
+  wandb_run_name: "stage3_joint_ft_max1024_KD0.2_H2.0_S0.0_removeTartan_Aug_epoch60"
+  datasets: ["sthereo", "vivid"]

@@ -68,6 +68,42 @@ def wandb_log(metrics: dict, step: int, use_wandb: bool) -> None:
         except Exception:
             pass
 
+# train_kd_sthereo.py 内の train_one_epoch 関数
+
+def train_one_epoch(model, teacher, loader, optimizer, device, config):
+    model.train()
+    for batch in loader:
+        # デュアル・テンソル対応の取り出し
+        img_8bit = batch['thr_t_8bit'].to(device)    # モデル入力用 (B, 3, H, W)
+        img_raw  = batch['thr_t_raw'].to(device)     # 物理損失用 (B, 1, H, W)
+        
+        optimizer.zero_grad()
+        
+        # 1. 生徒モデルのフォワード (8-bitを入力)
+        # 既存の XFeat モデルは 3ch の 8-bit 画像を期待しているため壊さない
+        feats_s, kpts_s, scores_s = model(img_8bit)
+        
+        # 2. 教師モデルのフォワード (RGB特徴空間への投影)
+        with torch.no_grad():
+            feats_t, _, _ = teacher(img_8bit)
+        
+        # 3. 損失計算
+        # KD損失 (既存)
+        l_kd = kd_feature_loss(feats_s, feats_t)
+        
+        # ハイブリッド熱勾配損失 (新規追加)
+        l_hybrid = 0
+        if config.get('use_hybrid_loss', False):
+            # 各バッチ内の画像をループまたはベクトル化して計算
+            l_hybrid = hybrid_thermal_gradient_loss(
+                kpts_s, scores_s, img_raw, 
+                bit_depth=config.get('bit_depth', 16)
+            )
+            
+        loss = l_kd + config.get('lambda_hybrid', 0.1) * l_hybrid
+        
+        loss.backward()
+        optimizer.step()
 
 # ---------------------------------------------------------------------------
 # CLI 引数
@@ -81,6 +117,8 @@ def get_args():
                    help='VIVID ルート（None の場合は SThErEO のみ）')
     p.add_argument('--ms2_root',          default=None,
                    help='MS2 ルート（None の場合は MS2 を使用しない）')
+    p.add_argument('--tartan_root', type=str, default=None, help='Path to TartanRGBT root')
+    p.add_argument('--freiburg_root', type=str, default=None, help='Path to Freiburg root')
     p.add_argument('--ms2_stride',        type=int, default=3)
     p.add_argument('--split',             default='all',
                    choices=['train', 'val', 'all'])
@@ -683,7 +721,7 @@ def main():
             epoch_spatial_losses.append(l_spatial_val)
             epoch_thermal_losses.append(l_thermal_val)
             global_step += 1
-            
+
             if i % 10 == 0:
                 print(f"  Step [{i:3d}/{steps_per_epoch}] "
                       f"Loss: {current_loss.item():.4f} "

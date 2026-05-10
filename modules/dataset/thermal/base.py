@@ -115,8 +115,8 @@ class ThermalDatasetBase(Dataset, ABC):
         thr = self._load_thr(thr_path)
 
         # 全データセット共通解像度にリサイズ（collate のため必須）
-        rgb = _resize_to_common(rgb)
-        thr = _resize_to_common(thr)
+        # rgb = _resize_to_common(rgb)
+        # thr = _resize_to_common(thr)
 
         # augment 前の熱画像を保存（diurnal_inversion 適用率計測用）
         thr_orig = thr.clone()
@@ -129,3 +129,30 @@ class ThermalDatasetBase(Dataset, ABC):
             'rgb_path': rgb_path,
             'thr_path': thr_path,
         }
+    
+    def _read_dual_thr(self, ppath: str) -> dict:
+        """
+        8-bit（学習用）と Raw（物理損失用）の両方を読み込む共通メソッド。
+        MS2以外のデータセットでのデフォルト挙動を定義。
+        """
+        # 16-bitを維持して読み込み
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None: raise FileNotFoundError(path)
+
+        # Rawテンソルの作成 (1ch, float32)
+        raw_img = img.astype(np.float32)
+        if raw_img.ndim == 3:
+            raw_img = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
+        t_raw = torch.from_numpy(raw_img).unsqueeze(0)
+
+        # 8-bitテンソルの作成 (既存の正規化ロジックを使用)
+        # SThErEO等の場合は既に8-bit化されていることが多いため、単純な正規化
+        if img.dtype == np.uint16:
+            img_8 = (img / 256).astype(np.uint8)
+        else:
+            img_8 = img.astype(np.uint8)
+        
+        img_8_rgb = cv2.cvtColor(img_8, cv2.COLOR_GRAY2RGB)
+        t_8bit = torch.from_numpy(img_8_rgb).permute(2, 0, 1).float() / 255.0
+
+        return {'8bit': t_8bit, 'raw': t_raw}

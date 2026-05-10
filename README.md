@@ -256,3 +256,7 @@ python train_pipeline.py \
     --init_type    rgb \
     --device       0
 ```
+```bash
+# staeg2の実行方法
+ python train_pipeline_hybrid_v2.py --start_stage 2 --config configs/config_master.yaml
+ ```

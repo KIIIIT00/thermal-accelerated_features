@@ -90,6 +90,7 @@ class MS2Dataset(ThermalDatasetBase):
     ):
         self.data_root = data_root
         self.subsample = subsample
+        self._pairs = []
         # MS2 は splits_dir を使わないが基底クラスに渡す
         super().__init__(
             splits_dir=splits_dir or data_root,
@@ -152,16 +153,75 @@ class MS2Dataset(ThermalDatasetBase):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
-    def _load_thr(self, path: str) -> Tensor:
-        """
-        AnyThermal MS2Dataset.read_thermal() に準拠。
+    # def _load_thr(self, path: str) -> Tensor:
+    #     """
+    #     AnyThermal MS2Dataset.read_thermal() に準拠。
 
-        thr/img_left/ の画像は hist_99 + bilateral でスケーリング済みの
-        8bit グレースケール画像。クロップは行わない（AnyThermal 準拠）。
+    #     thr/img_left/ の画像は hist_99 + bilateral でスケーリング済みの
+    #     8bit グレースケール画像。クロップは行わない（AnyThermal 準拠）。
+    #     """
+    #     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    #     if img is None:
+    #         raise FileNotFoundError(f"[MS2] Thermal not found: {path}")
+    #     img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    #     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    #     return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+    def _load_thr(self, path: str) -> dict:
         """
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
+        16-bit Raw の読み込みと、8-bit 前処理画像の生成を同時に行う
+        """
+        # 1. 16-bit Raw 読み込み (MS2 は 16-bit)
+        img_raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img_raw is None:
             raise FileNotFoundError(f"[MS2] Thermal not found: {path}")
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        
+        # --- 損失関数用の Raw テンソル ---
+        # 物理的な温度差を維持するため、float 化のみ行う
+        thr_raw = torch.from_numpy(img_raw.astype(np.float32)).unsqueeze(0)
+
+        # --- ネットワーク入力用の 8-bit 前処理 ---
+        # 1. hist_99 スケーリング
+        v_min, v_max = np.percentile(img_raw, [1.0, 99.0])
+        img_8bit = np.clip((img_raw - v_min) / (v_max - v_min + 1e-6) * 255, 0, 255).astype(np.uint8)
+
+        # 2. CLAHE (コントラスト強調)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        img_8bit = clahe.apply(img_8bit)
+
+        # 3. Bilateral Filter (エッジ保存平滑化)
+        img_8bit = cv2.bilateralFilter(img_8bit, 5, 20, 15)
+
+        # 4. Crop (静的ノイズ領域の除去 - sequential.py の設定に準拠)
+        h, w = img_8bit.shape[:2]
+        # 上:9, 下:35, 左:28, 右:34 をカット
+        img_8bit = img_8bit[9:h-35, 28:w-34]
+        # Raw 側も同じ範囲でクロップして座標を同期させる
+        thr_raw = thr_raw[:, 9:h-35, 28:w-34]
+
+        # テンソル化と正規化 (XFeat 入力用)
+        thr_8bit = torch.from_numpy(img_8bit).unsqueeze(0).float() / 255.0
+
+        return {
+            'thr_8bit': thr_8bit, # ネットワーク入力
+            'thr_raw':  thr_raw   # 物理勾配損失計算用
+        }
+    
+    def __len__(self) -> int:
+        return len(self.pairs)
+    
+    def __getitem__(self, index: int) -> dict:
+        rgb_path, thr_path = self.pairs[index]
+        
+        # RGB はこれまで通り (教師モデル用)
+        img_rgb = self._load_rgb(rgb_path) 
+        # Thermal はデュアル・テンソル
+        thr_dict = self._load_thr(thr_path)
+        
+        return {
+            'rgb': img_rgb,
+            'thr_t_8bit': thr_dict['thr_8bit'],
+            'thr_t_raw':  thr_dict['thr_raw'],
+            'dataset_name': 'ms2',
+            'bit_depth': 16
+        }

@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 import torch
 import yaml
+from scipy.spatial.transform import Rotation as R
 from torch import Tensor
 from torch.utils.data import Dataset
 
@@ -329,14 +330,21 @@ class TartanRGBTSequentialDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Tensor]:
         tp_t, tp_t1, T_rel, K = self._pairs[idx]
-        thr_t  = self._read_thr(tp_t)
-        thr_t1 = self._read_thr(tp_t1)
+        thr_t, size_t   = self._read_thr(tp_t)
+        thr_t1, size_t1 = self._read_thr(tp_t1)
+        
+        # orig_size は [W, H] 順（_read_thrで [orig_h, orig_w] と返ってきているので反転）
+        orig_size = torch.tensor([size_t[1], size_t[0]], dtype=torch.float32)
+
         return {
-            'thr_t'  : thr_t,
-            'thr_t1' : thr_t1,
-            'T_rel'  : torch.from_numpy(T_rel).float(),
-            'K'      : torch.from_numpy(K).float(),
-            'valid'  : torch.tensor(True),
+            'image0':     thr_t,
+            'image1':     thr_t1,
+            'orig_size0': orig_size,
+            'orig_size1': orig_size,
+            'T_rel':      torch.from_numpy(T_rel).float(),
+            'K':          torch.from_numpy(K).float(),
+            # 'valid':      torch.tensor(True),
+            'dataset_name': 'tartanrgbt'
         }
 
     @staticmethod
@@ -653,14 +661,20 @@ class FreiburgSequentialDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         tp_t, tp_t1 = self._pairs[idx]
-        thr_t  = self._read_thr(tp_t)
-        thr_t1 = self._read_thr(tp_t1)
+        thr_t, size_t   = self._read_thr(tp_t)
+        thr_t1, size_t1 = self._read_thr(tp_t1)
+
+        orig_size = torch.tensor([size_t[1], size_t[0]], dtype=torch.float32)
+
         return {
-            'thr_t'  : thr_t,
-            'thr_t1' : thr_t1,
-            'T_rel'  : torch.eye(4).float(),
-            'K'      : torch.eye(3).float(),
-            'valid'  : torch.tensor(False),
+            'image0':     thr_t,
+            'image1':     thr_t1,
+            'orig_size0': orig_size,
+            'orig_size1': orig_size,
+            'T_rel':      torch.eye(4).float(), # 単位行列のまま
+            'K':          torch.eye(3).float(),
+            # 'valid':      torch.tensor(False),  # 幾何学Loss無効フラグ
+            'dataset_name': 'freiburg'
         }
 
     @staticmethod
@@ -774,100 +788,105 @@ class FreiburgSequentialDataset(Dataset):
 # SThErEO シーケンスデータセット
 # ===========================================================================
 
-_STHEREO_K_DEFAULT = np.array([
+_STHEREO_K_RAW = np.array([
     [4.2943288714549999e+02, 0., 3.1111923634459998e+02],
     [0., 4.2953142750190000e+02, 2.6612817575460002e+02],
-    [0., 0., 1.],
+    [0., 0., 1.]
 ], dtype=np.float64)
 
+_STHEREO_D = np.array([-3.5808823350000002e-01, 9.9431845300000002e-02, 0., 0., 0.], dtype=np.float64)
 
-def _load_sthereo_K(calib_path: str) -> np.ndarray:
-    """
-    SThErEO の thermal_14bit_left.yaml から camera_matrix を読み込む。
-    thermal8_left_clahe は未 rectify 画像のため camera_matrix を使用する。
-    """
-    if not os.path.isfile(calib_path):
-        return _STHEREO_K_DEFAULT.copy()
-    try:
-        with open(calib_path) as f:
-            text = f.read()
-        # camera_matrix.data: [ ... ] を抽出
-        import re as _re
-        m = _re.search(
-            r'camera_matrix.*?data:\s*\[(.*?)\]', text, _re.DOTALL)
-        if m:
-            raw = m.group(1).replace('\n', ' ').replace('  ', ' ')
-            vals = [float(x.strip()) for x in raw.split(',') if x.strip()]
-            if len(vals) == 9:
-                return np.array(vals, dtype=np.float64).reshape(3, 3)
-    except Exception:
-        pass
-    return _STHEREO_K_DEFAULT.copy()
+# 補正後（Undistorted & Rectified）に使用すべきK行列
+_STHEREO_K_RECT = np.array([
+    [2.5233871067517285e+02, 0., 3.0724241065979004e+02],
+    [0., 2.5233871067517285e+02, 2.5017333030700684e+02],
+    [0., 0., 1.]
+], dtype=np.float64)
 
+_STHEREO_R_RECT = np.array([
+    [ 9.9997821966532652e-01, -5.3320014475053482e-03,  3.8897243511229682e-03],
+    [ 5.2797309798242676e-03,  9.9989725498223603e-01,  1.3326812063277928e-02],
+    [-3.9603832825374392e-03, -1.3305985102691455e-02,  9.9990362841861036e-01],
+], dtype=np.float64)
+
+# IMUから熱画像左への外部パラメータ
+# _T_CAM_IMU_STHEREO = np.array([
+#     [ 0.0,  0.0,  1.0,  0.3100],
+#     [-1.0,  0.0,  0.0, -0.2000],
+#     [ 0.0, -1.0,  0.0, -0.2400],
+#     [ 0.0,  0.0,  0.0,  1.0000]
+# ], dtype=np.float64)
+# _T_IMU_CAM_STHEREO = np.linalg.inv(_T_CAM_IMU_STHEREO)
+_T_IMU_CAM_STHEREO = np.array([
+    [ 0.0,  0.0,  1.0,  0.3100],
+    [-1.0,  0.0,  0.0, -0.2000],
+    [ 0.0, -1.0,  0.0, -0.2400],
+    [ 0.0,  0.0,  0.0,  1.0000]
+], dtype=np.float64)
+
+# IMUの相対軌跡をカメラ座標系に引き込むための逆行列 (IMU -> Cam)
+_T_CAM_IMU_STHEREO = np.linalg.inv(_T_IMU_CAM_STHEREO)
+
+
+# ===========================================================================
+# キャッシュ及びユーティリティ関数
+# ===========================================================================
+
+_STHEREO_UNDISTORT_MAPS_CACHE: dict = {}
+
+def _get_sthereo_undistort_maps(img_size: tuple):
+    """歪み補正 + 整流マップを生成してキャッシュする"""
+    if img_size not in _STHEREO_UNDISTORT_MAPS_CACHE:
+        map1, map2 = cv2.initUndistortRectifyMap(
+            _STHEREO_K_RAW,
+            _STHEREO_D,
+            _STHEREO_R_RECT,
+            _STHEREO_K_RECT,
+            img_size,
+            cv2.CV_32FC1,
+        )
+        _STHEREO_UNDISTORT_MAPS_CACHE[img_size] = (map1, map2)
+    return _STHEREO_UNDISTORT_MAPS_CACHE[img_size]
 
 def _load_sthereo_poses(pose_csv: str) -> List[Tuple[int, np.ndarray]]:
-    """
-    SThErEO global_pose.csv を読み込む。
-
-    フォーマット: timestamp_sec, E_utm, N_utm, alt_m, roll_deg, pitch_deg, yaw_deg
-
-    ローカル ENU フレームに変換（最初の座標を原点にオフセット）。
-    回転: ZYX Euler (yaw, pitch, roll) → 回転行列
-
-    Returns: [(timestamp_ns, T_world(4x4)), ...] ソート済み
-    """
+    """local_pose.csv から IMU ポーズ（T_world_imu）を読み込み、4x4行列に変換する"""
     if not os.path.isfile(pose_csv):
         return []
 
     result: List[Tuple[int, np.ndarray]] = []
-    ref_E = ref_N = ref_alt = None
-
     with open(pose_csv) as f:
         for line in f:
             line = line.strip()
-            if not line:
+            if not line or line.startswith('#'):
                 continue
             parts = line.split(',')
             if len(parts) < 7:
                 continue
             try:
-                ts_sec    = float(parts[0])
-                E, N, alt = float(parts[1]), float(parts[2]), float(parts[3])
+                ts_val    = float(parts[0])
+                x, y, z   = float(parts[1]), float(parts[2]), float(parts[3])
                 roll_deg  = float(parts[4])
                 pitch_deg = float(parts[5])
                 yaw_deg   = float(parts[6])
             except ValueError:
                 continue
 
-            if ref_E is None:
-                ref_E, ref_N, ref_alt = E, N, alt
+            ts_ns = int(ts_val) if ts_val > 1e15 else int(ts_val * 1e9)
 
-            t = np.array([E - ref_E, N - ref_N, alt - ref_alt], dtype=np.float64)
-
-            roll  = np.radians(roll_deg)
-            pitch = np.radians(pitch_deg)
-            yaw   = np.radians(yaw_deg)
-
-            cr, sr = np.cos(roll),  np.sin(roll)
-            cp, sp = np.cos(pitch), np.sin(pitch)
-            cy, sy = np.cos(yaw),   np.sin(yaw)
-
-            # ZYX Euler: world_R_body = Rz(yaw) @ Ry(pitch) @ Rx(roll)
-            Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
-            Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
-            Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
-            R  = Rz @ Ry @ Rx
+            # 🌟 修正ポイント: 誤った ScipyRotation 呼び出しを R に修正
+            rot = R.from_euler(
+                'zyx', [yaw_deg, pitch_deg, roll_deg], degrees=True
+            ).as_matrix()
 
             T = np.eye(4, dtype=np.float64)
-            T[:3, :3] = R
-            T[:3,  3] = t
-            result.append((int(ts_sec * 1e9), T))
+            T[:3, :3] = rot
+            T[:3,  3] = [x, y, z]
+            result.append((ts_ns, T))
 
+    result.sort(key=lambda x: x[0])
     return result
 
-
-def _nearest_pose_idx(ts_ns: int,
-                      sorted_ts: List[int]) -> int:
+def _nearest_pose_idx(ts_ns: int, sorted_ts: List[int]) -> int:
     """ソート済みタイムスタンプリストから最近傍インデックスを返す（二分探索）"""
     lo, hi = 0, len(sorted_ts) - 1
     while lo < hi:
@@ -881,30 +900,21 @@ def _nearest_pose_idx(ts_ns: int,
     return lo
 
 
+# ===========================================================================
+# SThErEO データセットクラス
+# ===========================================================================
+
 class SThErEOSequentialDataset(Dataset):
-    """
-    SThErEO の連続フレームペア + GT 相対姿勢データセット。
-
-    GT: pose/global_pose.csv (UTM ENU + ZYX Euler)
-    K:  calibration/thermal_14bit_left.yaml (camera_matrix)
-    Images: image/thermal8_left_clahe/{timestamp_ns}.png
-
-    Args:
-        data_root:  SThErEO ルート（kaist_morning 等が直下にある）
-        stride:     フレーム間隔（推奨: 5 以上。1 は baseline が退化して trivial）
-        split:      'train' | 'val' | 'all'
-        max_dt_ns:  画像-ポーズ タイムスタンプ許容差 [ns]
-    """
-
     _VAL_SEQS = frozenset(['snu_afternoon', 'kaist_morning', 'valley_afternoon'])
 
     def __init__(
         self,
         data_root:         str,
-        stride:            int = 5,
-        split:             str = 'val',
-        max_dt_ns:         int = 250_000_000,   # 250ms（ポーズ 2.5Hz = 400ms 間隔の半分強）
-        max_pairs_per_seq: int = 2000,
+        stride:            int   = 3,
+        split:             str   = 'val',
+        max_dt_ns:         int   = 250_000_000,
+        max_pairs_per_seq: int   = 2000,
+        min_trans_m:       float = 0.1,
     ):
         self.data_root = data_root
         self.stride    = stride
@@ -916,39 +926,28 @@ class SThErEOSequentialDataset(Dataset):
                 continue
 
             is_val = seq_name in self._VAL_SEQS
-            if split == 'train' and is_val:
-                continue
-            if split == 'val' and not is_val:
-                continue
+            if split == 'train' and is_val: continue
+            if split == 'val'   and not is_val: continue
 
-            # K
-            calib_path = os.path.join(
-                seq_dir, 'calibration', 'thermal_14bit_left.yaml')
-            K = _load_sthereo_K(calib_path)
-
-            # ポーズ
-            poses = _load_sthereo_poses(
-                os.path.join(seq_dir, 'pose', 'global_pose.csv'))
+            pose_csv = os.path.join(seq_dir, 'pose', 'local_pose.csv')
+            poses = _load_sthereo_poses(pose_csv)
             if len(poses) < 2:
                 print(f"[SThErEOSeq] {seq_name}: no pose data")
                 continue
-            pose_ts  = [p[0] for p in poses]
-            pose_Ts  = [p[1] for p in poses]
+            
+            pose_ts = [p[0] for p in poses]
+            pose_Ts = [p[1] for p in poses]
 
-            # 画像ディレクトリ
             img_dir = os.path.join(seq_dir, 'image', 'thermal8_left_clahe')
             if not os.path.isdir(img_dir):
                 img_dir = os.path.join(seq_dir, 'image', 'thermal8_left')
             if not os.path.isdir(img_dir):
-                print(f"[SThErEOSeq] {seq_name}: image dir not found")
                 continue
 
-            img_files = sorted(f for f in os.listdir(img_dir)
-                               if f.endswith('.png'))
+            img_files = sorted(f for f in os.listdir(img_dir) if f.endswith('.png'))
             if len(img_files) < 2:
                 continue
 
-            # 画像をポーズに対応付け（タイムスタンプ最近傍）
             matched: List[Tuple[str, np.ndarray]] = []
             for fname in img_files:
                 try:
@@ -960,29 +959,25 @@ class SThErEOSequentialDataset(Dataset):
                     matched.append((os.path.join(img_dir, fname), pose_Ts[idx]))
 
             if len(matched) < 2:
-                print(f"[SThErEOSeq] {seq_name}: no matched frames")
                 continue
 
-            # stride ペアを構築
+            K_out = _STHEREO_K_RECT.copy()
             n_added = 0
-            # for i in range(0, len(matched) - stride, stride):
-            #     j = i + stride
-            #     p_t,  T_t  = matched[i]
-            #     p_t1, T_t1 = matched[j]
-            #     T_rel = np.linalg.inv(T_t) @ T_t1
-            #     self._pairs.append((p_t, p_t1, T_rel, K))
+
             for i in range(0, len(matched) - stride, stride):
                 j = i + stride
-                p_t,  T_t  = matched[i]
-                p_t1, T_t1 = matched[j]
-                T_rel = np.linalg.inv(T_t) @ T_t1
-                
-                # --- ここを 0.01 から 0.5 に変更 ---
-                if np.linalg.norm(T_rel[:3, 3]) < 0.5:
+                p_t,  T_t_imu  = matched[i]
+                p_t1, T_t1_imu = matched[j]
+
+                T_rel_imu = np.linalg.inv(T_t_imu) @ T_t1_imu
+                T_rel_cam = _T_CAM_IMU_STHEREO @ T_rel_imu @ _T_IMU_CAM_STHEREO
+
+                if np.linalg.norm(T_rel_imu[:3, 3]) < min_trans_m:
                     continue
-                # -----------------------------------
-                
-                self._pairs.append((p_t, p_t1, T_rel, K))
+                if not np.isfinite(T_rel_cam).all():
+                    continue
+
+                self._pairs.append((p_t, p_t1, T_rel_cam, K_out))
                 n_added += 1
                 if n_added >= max_pairs_per_seq:
                     break
@@ -994,26 +989,786 @@ class SThErEOSequentialDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict:
         p_t, p_t1, T_rel, K = self._pairs[idx]
+        thr_t  = self._read_thr(p_t)
+        thr_t1 = self._read_thr(p_t1)
+
+        # SThErEOの _read_thr は [C, H, W] を返すため、shapeから取得
+        h, w = thr_t.shape[1:]
+        orig_size = torch.tensor([w, h], dtype=torch.float32)
+
         return {
-            'thr_t'  : self._read_thr(p_t),
-            'thr_t1' : self._read_thr(p_t1),
-            'T_rel'  : torch.from_numpy(T_rel).float(),
-            'K'      : torch.from_numpy(K).float(),
-            'valid'  : torch.tensor(True),
+            'image0':     thr_t,
+            'image1':     thr_t1,
+            'orig_size0': orig_size,
+            'orig_size1': orig_size,
+            'T_rel':      torch.from_numpy(T_rel).float(),
+            'K':          torch.from_numpy(K).float(),
+            # 'valid':      torch.tensor(True),
+            'dataset_name': 'sthereo'
         }
 
     @staticmethod
     def _read_thr(path: str) -> Tensor:
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            raise FileNotFoundError(path)
-        img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR),
-                           cv2.COLOR_BGR2RGB)
+            raise FileNotFoundError(f"[SThErEOSeq] not found: {path}")
+
+        h, w = img.shape[:2]
+        map1, map2 = _get_sthereo_undistort_maps((w, h))
+
+        img_rect = cv2.remap(
+            img, map1, map2,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        img_rgb = cv2.cvtColor(img_rect, cv2.COLOR_GRAY2RGB)
+        return torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+
+import os
+import numpy as np
+import cv2
+import torch
+from torch import Tensor
+from torch.utils.data import Dataset
+from typing import List, Tuple, Dict
+
+# ===========================================================================
+# 1. キャリブレーション定数 (Left & Right)[cite: 2, 3]
+# ===========================================================================
+
+# --- 左カメラ (Left) ---[cite: 3]
+_K_RAW_L = np.array([[429.43, 0., 311.12], [0., 429.53, 266.13], [0., 0., 1.]], dtype=np.float64)
+_D_L = np.array([-0.358088, 0.099431, 0., 0., 0.], dtype=np.float64)
+_R_RECT_L = np.array([
+    [ 0.999978, -0.005332,  0.003889],
+    [ 0.005279,  0.999897,  0.013326],
+    [-0.003960, -0.013305,  0.999903]
+], dtype=np.float64)
+
+# --- 右カメラ (Right) ---[cite: 2]
+_K_RAW_R = np.array([[427.27, 0., 337.72], [0., 422.59, 228.60], [0., 0., 1.]], dtype=np.float64)
+_D_R = np.array([-0.428438, 0.194761, 0., 0., 0.], dtype=np.float64)
+_R_RECT_R = np.array([
+    [ 0.998223, -0.007235,  0.059144],
+    [ 0.008022,  0.999882, -0.013084],
+    [-0.059043,  0.013536,  0.998163]
+], dtype=np.float64)
+
+# --- 共通 出力プロジェクション (K_rect) ---[cite: 2, 3]
+_K_RECT = np.array([
+    [252.33871, 0., 307.24241],
+    [0.,        252.33871, 250.17333],
+    [0.,        0.,        1.]
+], dtype=np.float64)
+
+# --- 完全無欠のステレオ GT Pose (Left -> Right) ---
+# X = -P_right[0,3] / f_x = 154.5491 / 252.3387
+_T_STEREO_REL = np.eye(4, dtype=np.float32)
+_T_STEREO_REL[0, 3] = 0.6124668 
+
+# キャッシュ
+_STEREO_MAPS_CACHE = {}
+
+def _get_stereo_maps(img_size: tuple):
+    """左右両方の歪み補正・整流マップを事前計算してキャッシュ"""
+    if img_size not in _STEREO_MAPS_CACHE:
+        map_L_1, map_L_2 = cv2.initUndistortRectifyMap(_K_RAW_L, _D_L, _R_RECT_L, _K_RECT, img_size, cv2.CV_32FC1)
+        map_R_1, map_R_2 = cv2.initUndistortRectifyMap(_K_RAW_R, _D_R, _R_RECT_R, _K_RECT, img_size, cv2.CV_32FC1)
+        _STEREO_MAPS_CACHE[img_size] = (map_L_1, map_L_2, map_R_1, map_R_2)
+    return _STEREO_MAPS_CACHE[img_size]
+
+# ===========================================================================
+# 2. オンザフライ前処理ロジック
+# ===========================================================================
+
+def _process_14bit_thermal(img_14bit: np.ndarray, clahe_clip: float = 2.0) -> np.ndarray:
+    """14-bit生画像をロバスト正規化し、CLAHEを適用して8-bit画像にする"""
+    # 0値（無効ピクセル）を除外してパーセンタイル計算
+    valid_pixels = img_14bit[img_14bit > 0]
+    if len(valid_pixels) == 0:
+        return np.zeros_like(img_14bit, dtype=np.uint8)
+
+    p1, p99 = np.percentile(valid_pixels, [1, 99])
+    
+    # Min-Max スケーリング (1%〜99%の範囲)
+    img_norm = (img_14bit.astype(np.float32) - p1) / (p99 - p1 + 1e-5)
+    img_norm = np.clip(img_norm * 255.0, 0, 255).astype(np.uint8)
+
+    # CLAHEの適用
+    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
+    img_clahe = clahe.apply(img_norm)
+    
+    return img_clahe
+
+# ===========================================================================
+# 3. データセットクラス
+# ===========================================================================
+
+class SThErEOStereoDataset(Dataset):
+    """
+    SThErEO のステレオペア (Left & Right) を出力するデータローダー。
+    - オンザフライで14-bit -> 8-bit CLAHE 前処理を実行
+    - 動的に歪み補正とステレオ整流を実行
+    - 完全な固定 GT ポーズ (_T_STEREO_REL) を出力
+    """
+    _VAL_SEQS = frozenset(['snu_afternoon', 'kaist_morning', 'valley_afternoon'])
+
+    def __init__(self, data_root: str, split: str = 'train'):
+        self.data_root = data_root
+        self._pairs: List[Tuple[str, str]] = []
+
+        for seq_name in sorted(os.listdir(data_root)):
+            seq_dir = os.path.join(data_root, seq_name)
+            if not os.path.isdir(seq_dir): continue
+
+            is_val = seq_name in self._VAL_SEQS
+            if split == 'train' and is_val: continue
+            if split == 'val'   and not is_val: continue
+
+            # 14-bit 生画像のディレクトリ
+            left_dir = os.path.join(seq_dir, 'image', 'stereo_thermal_14_left')
+            right_dir = os.path.join(seq_dir, 'image', 'stereo_thermal_14_right')
+            
+            if not (os.path.isdir(left_dir) and os.path.isdir(right_dir)):
+                print(f"[SThErEOStereo] {seq_name}: Missing 14-bit image directories. Skipping.")
+                continue
+
+            left_files = sorted([f for f in os.listdir(left_dir) if f.endswith('.png')])
+            right_files = sorted([f for f in os.listdir(right_dir) if f.endswith('.png')])
+
+            if not left_files or not right_files:
+                continue
+
+            # タイムスタンプ（数値）のリストを作成
+            left_ts = np.array([int(f.split('.')[0]) for f in left_files])
+            right_ts = np.array([int(f.split('.')[0]) for f in right_files])
+
+            # 許容する最大ズレ（例: 50ms = 50,000,000ns）
+            max_dt_ns = 50_000_000 
+
+            for i, l_ts in enumerate(left_ts):
+                # 左の時刻に最も近い右の時刻のインデックスを探す
+                diff = np.abs(right_ts - l_ts)
+                idx = np.argmin(diff)
+                
+                if diff[idx] < max_dt_ns:
+                    l_path = os.path.join(left_dir, left_files[i])
+                    r_path = os.path.join(right_dir, right_files[idx])
+                    self._pairs.append((l_path, r_path))
+
+            print(f"[SThErEOStereo] {seq_name}: Matched {len(self._pairs)} pairs")
+
+        print(f"[SThErEOStereo] Loaded {len(self._pairs)} perfect stereo pairs for split: {split}")
+
+    def __len__(self) -> int:
+        return len(self._pairs)
+
+    def __getitem__(self, idx: int) -> Dict:
+        path_L, path_R = self._pairs[idx]
+
+        # 14-bit画像の読み込み (cv2.IMREAD_UNCHANGED 必須)
+        img_raw_L = cv2.imread(path_L, cv2.IMREAD_UNCHANGED)
+        img_raw_R = cv2.imread(path_R, cv2.IMREAD_UNCHANGED)
+
+        if img_raw_L is None or img_raw_R is None:
+            raise FileNotFoundError(f"Failed to load stereo pair: {path_L}")
+
+        # オンザフライ前処理 (14-bit -> 8-bit CLAHE)
+        img_8bit_L = _process_14bit_thermal(img_raw_L)
+        img_8bit_R = _process_14bit_thermal(img_raw_R)
+
+        h, w = img_raw_L.shape[:2]
+        map_L1, map_L2, map_R1, map_R2 = _get_stereo_maps((w, h))
+
+        # 歪み補正とステレオ整流
+        img_rect_L = cv2.remap(img_8bit_L, map_L1, map_L2, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        img_rect_R = cv2.remap(img_8bit_R, map_R1, map_R2, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        # PyTorch Tensor (RGB 3ch [0, 1]) へ変換
+        img_rgb_L = cv2.cvtColor(img_rect_L, cv2.COLOR_GRAY2RGB)
+        img_rgb_R = cv2.cvtColor(img_rect_R, cv2.COLOR_GRAY2RGB)
+
+        tensor_L = torch.from_numpy(img_rgb_L).permute(2, 0, 1).float() / 255.0
+        tensor_R = torch.from_numpy(img_rgb_R).permute(2, 0, 1).float() / 255.0
+
+        return {
+            'thr_t':  tensor_L,           # Image 0 (Left)
+            'thr_t1': tensor_R,           # Image 1 (Right)
+            'T_rel':  torch.from_numpy(_T_STEREO_REL).float(),
+            'K':      torch.from_numpy(_K_RECT).float(),
+            # 'valid':  torch.tensor(True)
+        }
+
+# _STHEREO_K_RAW = np.array([
+#     [4.2943288714549999e+02, 0., 3.1111923634459998e+02],
+#     [0., 4.2953142750190000e+02, 2.6612817575460002e+02],
+#     [0., 0., 1.]
+# ], dtype=np.float64)
+
+# _STHEREO_D = np.array([-3.5808823350000002e-01, 9.9431845300000002e-02, 0., 0., 0.], dtype=np.float64)
+
+# # 🌟 補正後（Undistorted）に使用すべきK行列[cite: 19]
+# _STHEREO_K_RECT = np.array([
+#     [2.5233871067517285e+02, 0., 3.0724241065979004e+02],
+#     [0., 2.5233871067517285e+02, 2.5017333030700684e+02],
+#     [0., 0., 1.]
+# ], dtype=np.float64)
+
+# _STHEREO_R_RECT = np.array([
+#     [ 9.9997821966532652e-01, -5.3320014475053482e-03,  3.8897243511229682e-03],
+#     [ 5.2797309798242676e-03,  9.9989725498223603e-01,  1.3326812063277928e-02],
+#     [-3.9603832825374392e-03, -1.3305985102691455e-02,  9.9990362841861036e-01],
+# ], dtype=np.float64)
+
+# # 🌟 IMUから熱画像左への外部パラメータ
+# _T_CAM_IMU_STHEREO = np.array([
+#     [ 0.0,  0.0,  1.0,  0.3100],
+#     [-1.0,  0.0,  0.0, -0.2000],
+#     [ 0.0, -1.0,  0.0, -0.2400],
+#     [ 0.0,  0.0,  0.0,  1.0000]
+# ], dtype=np.float64)
+# _T_IMU_CAM_STHEREO = np.linalg.inv(_T_CAM_IMU_STHEREO)
+
+# _STHEREO_K_DEFAULT = np.array([
+#     [4.2943288714549999e+02, 0., 3.1111923634459998e+02],
+#     [0., 4.2953142750190000e+02, 2.6612817575460002e+02],
+#     [0., 0., 1.],
+# ], dtype=np.float64)
+
+# # undistortマップのキャッシュ
+# _STHEREO_UNDISTORT_MAPS_CACHE: dict = {}
+
+# def _get_sthereo_undistort_maps(img_size: tuple):
+#     """
+#     歪み補正 + 整流マップを生成してキャッシュする。
+ 
+#     変換の意味:
+#         歪んだ raw 画像 (K_raw 空間) → 整流された画像 (K_rect 空間)
+ 
+#     数学的根拠:
+#         cv2.initUndistortRectifyMap は以下を計算する:
+#             1. K_rect^-1 で正規化座標に投影
+#             2. R_rect^-1 で整流前の方向に逆回転
+#             3. K_raw で歪みモデルを適用して raw 画素座標を得る
+#         これにより remap(raw_img, map1, map2) = undistorted_rectified_img
+ 
+#     Args:
+#         img_size: (width, height) of the raw distorted image
+#     Returns:
+#         map1, map2: cv2.remap 用のマップ (float32)
+#     """
+#     if img_size not in _STHEREO_UNDISTORT_MAPS_CACHE:
+#         map1, map2 = cv2.initUndistortRectifyMap(
+#             _STHEREO_K_RAW,    # 歪みのある生カメラ行列
+#             _STHEREO_D,        # Plumb_bob 歪み係数 [k1, k2, p1, p2, k3]
+#             _STHEREO_R_RECT,   # 整流回転行列
+#             _STHEREO_K_RECT,   # 出力（整流後）カメラ行列
+#             img_size,          # (width, height)
+#             cv2.CV_32FC1,      # 出力マップの型
+#         )
+#         _STHEREO_UNDISTORT_MAPS_CACHE[img_size] = (map1, map2)
+#     return _STHEREO_UNDISTORT_MAPS_CACHE[img_size]
+
+# def _sthereo_euler_to_matrix(x, y, z, roll, pitch, yaw):
+#     """local_pose.csv[cite: 18] から4x4変換行列を生成"""
+#     # 回転順序は一般的、かつVIVIDの相似変換と整合するZYX度数法を採用
+#     rot = R.from_euler('zyx', [yaw, pitch, roll], degrees=True).as_matrix()
+#     T = np.eye(4, dtype=np.float64)
+#     T[:3, :3] = rot
+#     T[:3, 3] = [x, y, z]
+#     return T
+
+# def _load_sthereo_K(calib_path: str) -> np.ndarray:
+#     """
+#     SThErEO の thermal_14bit_left.yaml から camera_matrix を読み込む。
+#     thermal8_left_clahe は未 rectify 画像のため camera_matrix を使用する。
+#     """
+#     if not os.path.isfile(calib_path):
+#         return _STHEREO_K_DEFAULT.copy()
+#     try:
+#         with open(calib_path) as f:
+#             text = f.read()
+#         # camera_matrix.data: [ ... ] を抽出
+#         import re as _re
+#         m = _re.search(
+#             r'camera_matrix.*?data:\s*\[(.*?)\]', text, _re.DOTALL)
+#         if m:
+#             raw = m.group(1).replace('\n', ' ').replace('  ', ' ')
+#             vals = [float(x.strip()) for x in raw.split(',') if x.strip()]
+#             if len(vals) == 9:
+#                 return np.array(vals, dtype=np.float64).reshape(3, 3)
+#     except Exception:
+#         pass
+#     return _STHEREO_K_DEFAULT.copy()
+
+# def _load_sthereo_K(calib_path: str) -> np.ndarray:
+#     """
+#     SThErEO のカメラ行列を返す。
+ 
+#     重要: thermal8_left_clahe の画像は歪んだまま保存されている。
+#     __getitem__ の _read_thr() で cv2.remap による歪み補正を行い
+#     K_rect 空間に投影するため、出力する K は必ず K_rect を使用する。
+ 
+#     calib_path の存在に関わらず K_RECT を返す（歪み補正後の画像には K_RECT が正しい）。
+ 
+#     Returns:
+#         _STHEREO_K_RECT (3x3 float64): 整流後のカメラ行列
+#     """
+#     return _STHEREO_K_RECT.copy()
+
+
+# def _load_sthereo_poses(pose_csv: str) -> List[Tuple[int, np.ndarray]]:
+#     """
+#     SThErEO global_pose.csv を読み込む。
+
+#     フォーマット: timestamp_sec, E_utm, N_utm, alt_m, roll_deg, pitch_deg, yaw_deg
+
+#     ローカル ENU フレームに変換（最初の座標を原点にオフセット）。
+#     回転: ZYX Euler (yaw, pitch, roll) → 回転行列
+
+#     Returns: [(timestamp_ns, T_world(4x4)), ...] ソート済み
+#     """
+#     if not os.path.isfile(pose_csv):
+#         return []
+
+#     result: List[Tuple[int, np.ndarray]] = []
+#     ref_E = ref_N = ref_alt = None
+
+#     with open(pose_csv) as f:
+#         for line in f:
+#             line = line.strip()
+#             if not line:
+#                 continue
+#             parts = line.split(',')
+#             if len(parts) < 7:
+#                 continue
+#             try:
+#                 ts_sec    = float(parts[0])
+#                 E, N, alt = float(parts[1]), float(parts[2]), float(parts[3])
+#                 roll_deg  = float(parts[4])
+#                 pitch_deg = float(parts[5])
+#                 yaw_deg   = float(parts[6])
+#             except ValueError:
+#                 continue
+
+#             if ref_E is None:
+#                 ref_E, ref_N, ref_alt = E, N, alt
+
+#             t = np.array([E - ref_E, N - ref_N, alt - ref_alt], dtype=np.float64)
+
+#             roll  = np.radians(roll_deg)
+#             pitch = np.radians(pitch_deg)
+#             yaw   = np.radians(yaw_deg)
+
+#             cr, sr = np.cos(roll),  np.sin(roll)
+#             cp, sp = np.cos(pitch), np.sin(pitch)
+#             cy, sy = np.cos(yaw),   np.sin(yaw)
+
+#             # ZYX Euler: world_R_body = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+#             Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+#             Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+#             Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+#             R  = Rz @ Ry @ Rx
+
+#             T = np.eye(4, dtype=np.float64)
+#             T[:3, :3] = R
+#             T[:3,  3] = t
+#             result.append((int(ts_sec * 1e9), T))
+
+#     return result
+
+# def _load_sthereo_poses(pose_csv: str) -> List[Tuple[int, np.ndarray]]:
+#     """
+#     local_pose.csv から IMU ポーズ（T_world_imu）を読み込み、4x4行列に変換する。
+ 
+#     フォーマット: timestamp, x, y, z, roll, pitch, yaw
+#         - timestamp : 秒またはナノ秒（桁数で自動判定）
+#         - x, y, z   : IMU 位置 [m]（world 座標系）
+#         - roll, pitch, yaw : ZYX Euler 角 [degrees]
+#           → R = R_z(yaw) @ R_y(pitch) @ R_x(roll)（scipy 'zyx' 順）
+ 
+#     Returns:
+#         [(timestamp_ns, T_world_imu 4x4), ...] タイムスタンプ昇順
+#     """
+#     if not os.path.isfile(pose_csv):
+#         return []
+ 
+#     result: List[Tuple[int, np.ndarray]] = []
+#     with open(pose_csv) as f:
+#         for line in f:
+#             line = line.strip()
+#             if not line or line.startswith('#'):
+#                 continue
+#             parts = line.split(',')
+#             if len(parts) < 7:
+#                 continue
+#             try:
+#                 ts_val    = float(parts[0])
+#                 x, y, z   = float(parts[1]), float(parts[2]), float(parts[3])
+#                 roll_deg  = float(parts[4])
+#                 pitch_deg = float(parts[5])
+#                 yaw_deg   = float(parts[6])
+#             except ValueError:
+#                 continue
+ 
+#             # タイムスタンプ: > 1e15 はナノ秒、それ以外は秒として変換
+#             ts_ns = int(ts_val) if ts_val > 1e15 else int(ts_val * 1e9)
+ 
+#             # ZYX Euler → 回転行列: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+#             # scipy 'zyx' は (z 軸まわり, y 軸まわり, x 軸まわり) の内因的回転
+#             # = Rz(angles[0]) @ Ry(angles[1]) @ Rx(angles[2]) と等価
+#             rot = ScipyRotation.from_euler(
+#                 'zyx', [yaw_deg, pitch_deg, roll_deg], degrees=True
+#             ).as_matrix()
+ 
+#             T = np.eye(4, dtype=np.float64)
+#             T[:3, :3] = rot
+#             T[:3,  3] = [x, y, z]
+#             result.append((ts_ns, T))
+ 
+#     # タイムスタンプ昇順に整列（二分探索の前提）
+#     result.sort(key=lambda x: x[0])
+#     return result
+
+# def _nearest_pose_idx(ts_ns: int,
+#                       sorted_ts: List[int]) -> int:
+#     """ソート済みタイムスタンプリストから最近傍インデックスを返す（二分探索）"""
+#     lo, hi = 0, len(sorted_ts) - 1
+#     while lo < hi:
+#         mid = (lo + hi) // 2
+#         if sorted_ts[mid] < ts_ns:
+#             lo = mid + 1
+#         else:
+#             hi = mid
+#     if lo > 0 and abs(sorted_ts[lo-1] - ts_ns) < abs(sorted_ts[lo] - ts_ns):
+#         return lo - 1
+#     return lo
+
+
+# class SThErEOSequentialDataset(Dataset):
+#     """
+#     SThErEO の連続フレームペア + GT 相対姿勢データセット（完全実装版）。
+ 
+#     キャリブレーション仕様 (thermal_14bit_left.yaml):
+#         K_raw  (4.29e2 fx/fy) : 生画像の歪みあり内部行列
+#         D      (Plumb_bob)    : 歪み係数 [k1, k2, p1, p2, k3]
+#         R_rect               : 整流行列
+#         K_rect (2.52e2 fx/fy) : 整流後の内部行列 → 出力 K として使用
+ 
+#     外部パラメータ (imu_2_thermal_left):
+#         T_cam_imu = [[0,0,1,0.31],[-1,0,0,-0.20],[0,-1,0,-0.24],[0,0,0,1]]
+ 
+#     ポーズ (local_pose.csv):
+#         フォーマット: timestamp, x, y, z, roll, pitch, yaw
+#         回転: ZYX Euler (degrees) → R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+ 
+#     相対姿勢の計算:
+#         T_rel_imu = inv(T_t_imu) @ T_t1_imu      # IMU frame での相対姿勢
+#         T_rel_cam = T_cam_imu @ T_rel_imu @ T_imu_cam  # カメラ frame に変換
+ 
+#     画像処理:
+#         cv2.remap で歪み補正 + 整流（K_raw 空間 → K_rect 空間へ投影）
+#         マップは画像サイズをキーとしてキャッシュ（シーケンスあたり1回のみ計算）
+ 
+#     出力:
+#         thr_t, thr_t1  : (3, H, W) float32 Tensor [0,1]（整流済み）
+#         T_rel          : (4, 4) float32 Tensor（カメラ座標系の相対姿勢）
+#         K              : (3, 3) float32 Tensor（K_rect）
+#         valid          : True（GPS/IMU GT は常に有効）
+#     """
+ 
+#     _VAL_SEQS = frozenset(['snu_afternoon', 'kaist_morning', 'valley_afternoon'])
+ 
+#     def __init__(
+#         self,
+#         data_root:         str,
+#         stride:            int   = 3,
+#         split:             str   = 'val',
+#         max_dt_ns:         int   = 250_000_000,  # 許容タイムスタンプ差 [ns]
+#         max_pairs_per_seq: int   = 2000,
+#         min_trans_m:       float = 0.1,           # 最小並進量フィルタ [m]
+#     ):
+#         self.data_root = data_root
+#         self.stride    = stride
+#         self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
+ 
+#         for seq_name in sorted(os.listdir(data_root)):
+#             seq_dir = os.path.join(data_root, seq_name)
+#             if not os.path.isdir(seq_dir):
+#                 continue
+ 
+#             is_val = seq_name in self._VAL_SEQS
+#             if split == 'train' and is_val:
+#                 continue
+#             if split == 'val'   and not is_val:
+#                 continue
+ 
+#             # ── ポーズ読み込み (local_pose.csv) ────────────────────────────
+#             pose_csv = os.path.join(seq_dir, 'pose', 'local_pose.csv')
+#             poses = _load_sthereo_poses(pose_csv)
+#             if len(poses) < 2:
+#                 print(f"[SThErEOSeq] {seq_name}: no pose data ({pose_csv})")
+#                 continue
+#             pose_ts = [p[0] for p in poses]
+#             pose_Ts = [p[1] for p in poses]
+ 
+#             # ── 画像ディレクトリ ────────────────────────────────────────────
+#             img_dir = os.path.join(seq_dir, 'image', 'thermal8_left_clahe')
+#             if not os.path.isdir(img_dir):
+#                 img_dir = os.path.join(seq_dir, 'image', 'thermal8_left')
+#             if not os.path.isdir(img_dir):
+#                 print(f"[SThErEOSeq] {seq_name}: image dir not found")
+#                 continue
+ 
+#             img_files = sorted(f for f in os.listdir(img_dir) if f.endswith('.png'))
+#             if len(img_files) < 2:
+#                 continue
+ 
+#             # ── タイムスタンプ同期（最近傍探索）────────────────────────────
+#             matched: List[Tuple[str, np.ndarray]] = []
+#             for fname in img_files:
+#                 try:
+#                     img_ts_ns = int(fname.split('.')[0])
+#                 except ValueError:
+#                     continue
+#                 idx = _nearest_pose_idx(img_ts_ns, pose_ts)
+#                 if abs(pose_ts[idx] - img_ts_ns) < max_dt_ns:
+#                     matched.append((os.path.join(img_dir, fname), pose_Ts[idx]))
+ 
+#             if len(matched) < 2:
+#                 print(f"[SThErEOSeq] {seq_name}: no matched frames")
+#                 continue
+ 
+#             # ── stride ペアを構築 ───────────────────────────────────────────
+#             # K_rect を出力カメラ行列として使用（undistort 後の有効行列）
+#             K_out = _STHEREO_K_RECT.copy()
+#             n_added = 0
+ 
+#             for i in range(0, len(matched) - stride, stride):
+#                 j = i + stride
+#                 p_t,  T_t_imu  = matched[i]
+#                 p_t1, T_t1_imu = matched[j]
+ 
+#                 # ──────────────────────────────────────────────────────────
+#                 # 相対姿勢の計算（仕様 Section 2 の Similarity Transform）
+#                 #
+#                 # Step1: IMU frame での相対姿勢
+#                 #   T_rel_imu = inv(T_t_imu) @ T_t1_imu
+#                 #
+#                 # Step2: カメラ frame への座標変換
+#                 #   T_rel_cam = T_cam_imu @ T_rel_imu @ T_imu_cam
+#                 #
+#                 # 数学的根拠:
+#                 #   T_rel_imu は body frame での t→t+1 の変換行列。
+#                 #   これをカメラ座標系で表現するには
+#                 #   「IMU→カメラ」の同次変換で左右から挟む。
+#                 # ──────────────────────────────────────────────────────────
+#                 T_rel_imu = np.linalg.inv(T_t_imu) @ T_t1_imu
+#                 T_rel_cam = _T_CAM_IMU_STHEREO @ T_rel_imu @ _T_IMU_CAM_STHEREO
+ 
+#                 # 並進量フィルタ（IMU frame の生 meter 値で判定）
+#                 if np.linalg.norm(T_rel_imu[:3, 3]) < min_trans_m:
+#                     continue
+ 
+#                 # 回転行列の健全性チェック
+#                 if not np.isfinite(T_rel_cam).all():
+#                     continue
+ 
+#                 self._pairs.append((p_t, p_t1, T_rel_cam, K_out))
+#                 n_added += 1
+#                 if n_added >= max_pairs_per_seq:
+#                     break
+ 
+#             print(f"[SThErEOSeq] {seq_name}: {n_added} pairs (stride={stride})")
+ 
+#     def __len__(self) -> int:
+#         return len(self._pairs)
+ 
+#     def __getitem__(self, idx: int) -> Dict:
+#         p_t, p_t1, T_rel, K = self._pairs[idx]
+#         return {
+#             'thr_t'  : self._read_thr(p_t),
+#             'thr_t1' : self._read_thr(p_t1),
+#             'T_rel'  : torch.from_numpy(T_rel).float(),
+#             'K'      : torch.from_numpy(K).float(),
+#             'valid'  : torch.tensor(True),
+#         }
+ 
+#     @staticmethod
+#     def _read_thr(path: str) -> Tensor:
+#         """
+#         熱画像を読み込み、歪み補正 + 整流を適用してテンソルを返す。
+ 
+#         処理フロー:
+#             1. cv2.IMREAD_GRAYSCALE で 8-bit 画像を読み込む
+#                （thermal8_left_clahe は CLAHE 適用済み 8-bit PNG）
+#             2. _get_sthereo_undistort_maps(w, h) でマップを取得
+#                （キャッシュ済みなら即座に返る）
+#             3. cv2.remap で歪み補正 + 整流を適用
+#                （K_raw 空間 → K_rect 空間へ投影）
+#             4. グレースケール → 3ch RGB に変換
+#             5. [0.0, 1.0] float32 テンソルで返す
+ 
+#         Returns:
+#             Tensor (3, H, W): 整流済み熱画像テンソル
+#         """
+#         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+#         if img is None:
+#             raise FileNotFoundError(f"[SThErEOSeq] not found: {path}")
+ 
+#         h, w = img.shape[:2]
+ 
+#         # 歪み補正 + 整流マップを取得（キャッシュから）
+#         map1, map2 = _get_sthereo_undistort_maps((w, h))
+ 
+#         # remap: raw 歪み画像 → K_rect 平面に投影
+#         img_rect = cv2.remap(
+#             img, map1, map2,
+#             interpolation=cv2.INTER_LINEAR,
+#             borderMode=cv2.BORDER_CONSTANT,
+#             borderValue=0,
+#         )
+ 
+#         # グレースケール → 3ch RGB（XFeat 入力形式）
+#         img_rgb = cv2.cvtColor(img_rect, cv2.COLOR_GRAY2RGB)
+ 
+#         return torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
         
-        tensor_img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        _, orig_h, orig_w = tensor_img.shape
+# class SThErEOSequentialDataset(Dataset):
+#     """
+#     SThErEO の連続フレームペア + GT 相対姿勢データセット。
+
+#     GT: pose/global_pose.csv (UTM ENU + ZYX Euler)
+#     K:  calibration/thermal_14bit_left.yaml (camera_matrix)
+#     Images: image/thermal8_left_clahe/{timestamp_ns}.png
+
+#     Args:
+#         data_root:  SThErEO ルート（kaist_morning 等が直下にある）
+#         stride:     フレーム間隔（推奨: 5 以上。1 は baseline が退化して trivial）
+#         split:      'train' | 'val' | 'all'
+#         max_dt_ns:  画像-ポーズ タイムスタンプ許容差 [ns]
+#     """
+
+#     _VAL_SEQS = frozenset(['snu_afternoon', 'kaist_morning', 'valley_afternoon'])
+
+#     def __init__(
+#         self,
+#         data_root:         str,
+#         stride:            int = 5,
+#         split:             str = 'val',
+#         max_dt_ns:         int = 250_000_000,   # 250ms（ポーズ 2.5Hz = 400ms 間隔の半分強）
+#         max_pairs_per_seq: int = 2000,
+#     ):
+#         self.data_root = data_root
+#         self.stride    = stride
+#         self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
+
+#         for seq_name in sorted(os.listdir(data_root)):
+#             seq_dir = os.path.join(data_root, seq_name)
+#             if not os.path.isdir(seq_dir):
+#                 continue
+
+#             is_val = seq_name in self._VAL_SEQS
+#             if split == 'train' and is_val:
+#                 continue
+#             if split == 'val' and not is_val:
+#                 continue
+
+#             # K
+#             calib_path = os.path.join(
+#                 seq_dir, 'calibration', 'thermal_14bit_left.yaml')
+#             K = _load_sthereo_K(calib_path)
+
+#             # ポーズ
+#             poses = _load_sthereo_poses(
+#                 os.path.join(seq_dir, 'pose', 'global_pose.csv'))
+#             if len(poses) < 2:
+#                 print(f"[SThErEOSeq] {seq_name}: no pose data")
+#                 continue
+#             pose_ts  = [p[0] for p in poses]
+#             pose_Ts  = [p[1] for p in poses]
+
+#             # 画像ディレクトリ
+#             img_dir = os.path.join(seq_dir, 'image', 'thermal8_left_clahe')
+#             if not os.path.isdir(img_dir):
+#                 img_dir = os.path.join(seq_dir, 'image', 'thermal8_left')
+#             if not os.path.isdir(img_dir):
+#                 print(f"[SThErEOSeq] {seq_name}: image dir not found")
+#                 continue
+
+#             img_files = sorted(f for f in os.listdir(img_dir)
+#                                if f.endswith('.png'))
+#             if len(img_files) < 2:
+#                 continue
+
+#             # 画像をポーズに対応付け（タイムスタンプ最近傍）
+#             matched: List[Tuple[str, np.ndarray]] = []
+#             for fname in img_files:
+#                 try:
+#                     img_ts_ns = int(fname.split('.')[0])
+#                 except ValueError:
+#                     continue
+#                 idx = _nearest_pose_idx(img_ts_ns, pose_ts)
+#                 if abs(pose_ts[idx] - img_ts_ns) < max_dt_ns:
+#                     matched.append((os.path.join(img_dir, fname), pose_Ts[idx]))
+
+#             if len(matched) < 2:
+#                 print(f"[SThErEOSeq] {seq_name}: no matched frames")
+#                 continue
+
+#             # stride ペアを構築
+#             n_added = 0
+#             # for i in range(0, len(matched) - stride, stride):
+#             #     j = i + stride
+#             #     p_t,  T_t  = matched[i]
+#             #     p_t1, T_t1 = matched[j]
+#             #     T_rel = np.linalg.inv(T_t) @ T_t1
+#             #     self._pairs.append((p_t, p_t1, T_rel, K))
+#             for i in range(0, len(matched) - stride, stride):
+#                 j = i + stride
+#                 p_t,  T_t  = matched[i]
+#                 p_t1, T_t1 = matched[j]
+#                 T_rel = np.linalg.inv(T_t) @ T_t1
+                
+#                 # --- ここを 0.01 から 0.5 に変更 ---
+#                 if np.linalg.norm(T_rel[:3, 3]) < 0.5:
+#                     continue
+#                 # -----------------------------------
+                
+#                 self._pairs.append((p_t, p_t1, T_rel, K))
+#                 n_added += 1
+#                 if n_added >= max_pairs_per_seq:
+#                     break
+
+#             print(f"[SThErEOSeq] {seq_name}: {n_added} pairs (stride={stride})")
+
+#     def __len__(self) -> int:
+#         return len(self._pairs)
+
+#     def __getitem__(self, idx: int) -> Dict:
+#         p_t, p_t1, T_rel, K = self._pairs[idx]
+#         return {
+#             'thr_t'  : self._read_thr(p_t),
+#             'thr_t1' : self._read_thr(p_t1),
+#             'T_rel'  : torch.from_numpy(T_rel).float(),
+#             'K'      : torch.from_numpy(K).float(),
+#             'valid'  : torch.tensor(True),
+#         }
+
+#     @staticmethod
+#     def _read_thr(path: str) -> Tensor:
+#         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+#         if img is None:
+#             raise FileNotFoundError(path)
+#         img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR),
+#                            cv2.COLOR_BGR2RGB)
         
-        return tensor_img, torch.tensor([orig_h, orig_w])
+#         tensor_img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+#         _, orig_h, orig_w = tensor_img.shape
+        
+#         return tensor_img, torch.tensor([orig_h, orig_w])
 
 
 # ===========================================================================
@@ -1524,23 +2279,52 @@ class VividSequentialDataset(Dataset):
         return len(self._pairs)
 
     def __getitem__(self, idx: int) -> Dict:
+        # VIVID の時系列ペアとポーズ、K行列を取得
         p_t, p_t1, T_rel, K = self._pairs[idx]
+
+        # AnyThermal 前処理 (MS2 と同じロジックを適用)
+        dict_t  = self._read_thr(p_t)
+        dict_t1 = self._read_thr(p_t1)
+
+        # 🌟 重要：VIVID の画像サイズを取得
+        # dict_t['8bit'] は [C, H, W] 形状
+        h, w = dict_t['8bit'].shape[1:]
+        orig_size = torch.tensor([w, h], dtype=torch.float32)
+
         return {
-            'thr_t'  : self._read_thr(p_t),
-            'thr_t1' : self._read_thr(p_t1),
-            'T_rel'  : torch.from_numpy(T_rel).float(),
-            'K'      : torch.from_numpy(K).float(),
-            'valid'  : torch.tensor(True),
+            'image0':     dict_t['8bit'],   # キー名を統一
+            'image1':     dict_t1['8bit'],
+            'orig_size0': orig_size,        # 🌟 LightGlue に必須
+            'orig_size1': orig_size,
+            'T_rel':      torch.from_numpy(T_rel).float(),
+            'K':          torch.from_numpy(K).float(),
+            # 'valid':      torch.tensor(True),
+            # 必要に応じて Raw も保持
+            # 'image0_raw': dict_t['raw'],
+            # 'image1_raw': dict_t1['raw'],
+            'dataset_name': 'vivid'         # デバッグや可視化に便利
         }
 
     @staticmethod
-    def _read_thr(path: str) -> Tensor:
+    def _read_thr(path: str) -> dict: 
+        import cv2
+        import torch
+
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise FileNotFoundError(path)
-        img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR),
-                           cv2.COLOR_BGR2RGB)
-        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            
+        # グレースケール画像をRGBの3チャンネルに変換
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        
+        # PyTorchテンソル [C, H, W] (0.0~1.0) に変換
+        t_8bit = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+
+        # 🌟 MS2のインターフェースと完全に一致させるために辞書で返す
+        return {
+            '8bit': t_8bit,
+            'raw': t_8bit.clone() # Rawデータも念のため保持
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1666,44 +2450,30 @@ def _load_ms2_K(calib_path: str) -> np.ndarray:
 class MS2SequentialDataset(Dataset):
     """
     MS2 データセットの連続フレームペア + GT 相対姿勢。
-
-    GT ポーズ:
-        odom/{seq}/thr/*.txt  ← 熱画像カメラのオドメトリ・タイムスタンプ
-        実際のファイル名はシーケンスによって異なる場合がある。
-        odom_thr.txt または *.txt の最初のファイルを使用する。
-    画像:
-        sync_data/{seq}/thr/img_left/*.png
-        → hist_99 + bilateral 前処理済み
-
-    前処理の注意:
-        MS2 は hist_99（99パーセンタイル正規化）+ bilateral フィルタを使用。
-        SThErEO/VIVID は CLAHE を使用。
-        → MS2 の画像は CLAHE をオプションで追加適用して統一可能。
-        → apply_clahe=True（デフォルト）で SThErEO と前処理を統一。
-
-    Args:
-        data_root:         MS2 ルートディレクトリ
-        stride:            フレーム間隔（推奨: 3-5）
-        split:             'train' | 'val' | 'all'
-        max_pairs_per_seq: 1シーケンスあたりの最大ペア数
-        apply_clahe:       True=CLAHE 追加適用（SThErEO との前処理統一）
-        clahe_clip_range:  CLAHE clipLimit のランダム範囲 (min, max)
     """
-
     def __init__(
         self,
-        data_root:         str,
-        stride:            int = 3,
-        split:             str = 'all',
+        data_root: str,
+        stride: int = 3,
+        split: str = 'all',
         max_pairs_per_seq: int = 2000,
-        apply_clahe:       bool = True,
-        clahe_clip_range:  tuple = (1.5, 3.0),
+        apply_clahe: bool = True,
+        min_translation: float = 0.5, # マジックナンバーを引数化
     ):
-        self.data_root       = data_root
-        self.stride          = stride
-        self.apply_clahe     = apply_clahe
-        self.clahe_clip_range = clahe_clip_range
+        self.data_root = data_root
+        self.stride = stride
+        self.apply_clahe = apply_clahe
+        self.min_translation = min_translation
         self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
+        
+        # デバッグ用のカウントをインスタンス変数で安全に管理
+        self._debug_save_count = 0 
+
+        # --- クロップの固定値 ---
+        self.crop_top = 9
+        self.crop_bottom = 35
+        self.crop_left = 28
+        self.crop_right = 34
 
         if split == 'all':
             seqs = _MS2_TRAIN_SEQS + _MS2_VAL_SEQS
@@ -1716,64 +2486,58 @@ class MS2SequentialDataset(Dataset):
         odom_root = os.path.join(data_root, 'odom')
 
         for seq_name in seqs:
-            # 画像: sync_data/{seq}/thr/img_left/{idx:06d}.png
             thr_img_dir  = os.path.join(sync_root, seq_name, 'thr', 'img_left')
-            # pose:  odom/{seq}/thr/{idx:06d}.txt （フレームごとに個別ファイル）
             thr_pose_dir = os.path.join(odom_root,  seq_name, 'thr')
 
-            if not os.path.isdir(thr_img_dir):
-                continue
-            if not os.path.isdir(thr_pose_dir):
-                print(f"[MS2Seq] {seq_name}: pose dir なし → skip")
+            if not os.path.isdir(thr_img_dir) or not os.path.isdir(thr_pose_dir):
+                print(f"[MS2Seq] {seq_name}: dirs missing → skip")
                 continue
 
-            # 画像ファイル一覧（インデックス順）
-            img_files = sorted(
-                f for f in os.listdir(thr_img_dir) if f.endswith('.png'))
-            if len(img_files) < 2:
-                continue
-
-            # フレームインデックスで画像と pose を直接対応付け
-            # 000668.png ↔ 000668.txt（タイムスタンプ照合不要）
+            img_files = sorted(f for f in os.listdir(thr_img_dir) if f.endswith('.png'))
+            
             matched = []
             for fname in img_files:
-                stem      = fname.rsplit('.', 1)[0]   # '000668'
+                stem = fname.rsplit('.', 1)[0]
                 pose_path = os.path.join(thr_pose_dir, stem + '.txt')
+                # Depth Pase
+                # depth_path = os.path.join(self.data_root, 'proj_depth', seq_name, 'thr', 'depth_filtered', stem + '.png')
+                depth_path = os.path.join(self.data_root, 'proj_depth', seq_name, 'thr', 'depth', stem + '.png')
                 T = _load_ms2_frame_pose(pose_path)
-                if T is not None:
-                    matched.append((
-                        os.path.join(thr_img_dir, fname), T))
+                if T is not None and os.path.exists(depth_path):
+                    matched.append((os.path.join(thr_img_dir, fname), T, depth_path))
 
             if len(matched) < 2:
-                print(f"[MS2Seq] {seq_name}: matched={len(matched)} → skip")
                 continue
 
-            # stride でペアを構築
             calib_path = os.path.join(sync_root, seq_name, 'calib.npy')
             K = _load_ms2_K(calib_path)
 
             n_added = 0
-            # for i in range(0, len(matched) - stride, stride):
-            #     j = i + stride
-            #     p_t,  T_t  = matched[i]
-            #     p_t1, T_t1 = matched[j]
-            #     T_rel = np.linalg.inv(T_t) @ T_t1
-            #     if np.linalg.norm(T_rel[:3, 3]) < 0.01:
-            #         continue
-            #     # 読み込んだK行列をペア情報として保存
-            #     self._pairs.append((p_t, p_t1, T_rel, K))
-            for i in range(0, len(matched) - stride, stride):
-                j = i + stride
-                p_t,  T_t  = matched[i]
-                p_t1, T_t1 = matched[j]
-                T_rel = np.linalg.inv(T_t) @ T_t1
+            for i in range(0, len(matched) - self.stride, self.stride):
+                j = i + self.stride
+                p_t,  T_t, depth_path0  = matched[i]
+                p_t1, T_t1, depth_path1 = matched[j]
                 
-                # --- ここを 0.01 から 0.5 に変更 ---
-                if np.linalg.norm(T_rel[:3, 3]) < 0.5:
+                T_rel_native = np.linalg.inv(T_t) @ T_t1
+                
+                # T_rel = np.linalg.inv(T_t) @ T_t1
+                T_rel_native = np.linalg.inv(T_rel_native)
+
+                T_conv = np.array([
+                    [ 0.0,  0.0,  1.0,  0.0],  # CVのX = ネイティブのZ
+                    [ 0.0,  1.0,  0.0,  0.0],  # CVのY = ネイティブのY (そのまま)
+                    [ 1.0,  0.0,  0.0,  0.0],  # CVのZ = ネイティブのX
+                    [ 0.0,  0.0,  0.0,  1.0]
+                ], dtype=np.float64)
+                
+                # 3. 相似変換の適用
+                T_rel = T_conv @ T_rel_native @ np.linalg.inv(T_conv)
+                
+                # 並進フィルタ
+                if np.linalg.norm(T_rel[:3, 3]) < self.min_translation:
                     continue
-                # -----------------------------------
                 
-                self._pairs.append((p_t, p_t1, T_rel, K))
+                self._pairs.append((p_t, p_t1, T_rel, K, depth_path0, depth_path1))
                 n_added += 1
                 if n_added >= max_pairs_per_seq:
                     break
@@ -1784,32 +2548,54 @@ class MS2SequentialDataset(Dataset):
         return len(self._pairs)
 
     def __getitem__(self, idx: int) -> Dict:
-        p_t, p_t1, T_rel, K = self._pairs[idx]
+        p_t, p_t1, T_rel, K_orig, depth_path0, depth_path1 = self._pairs[idx]
 
-        # dual thermal tensor
-        data_t  = self._read_dual_thr(p_t)
-        data_t1 = self._read_dual_thr(p_t1)
+        dict_t  = self._process_image(p_t)
+        dict_t1 = self._process_image(p_t1)
+        
+        # depth load
+        depth0 = cv2.imread(depth_path0, cv2.IMREAD_UNCHANGED).astype(np.float32) / 256.0
+        depth1 = cv2.imread(depth_path1, cv2.IMREAD_UNCHANGED).astype(np.float32) / 256.0
 
-        return {
-            'thr_t_8bit': dict_t['8bit'],
-            'thr_t_raw': dict_t['raw'],
-            'thr_t1_8bit': dict_t1['8bit'],
-            'thr_t1_raw': dict_t1['raw'],
-            'T_rel': torch.from_numpy(T_rel).float(),
-            'K': torch.from_numpy(K).float(),
-            'valid': torch.tensor(True),
-        }
+        K_cropped = K_orig.copy()
+        K_cropped[0, 2] -= self.crop_left
+        K_cropped[1, 2] -= self.crop_top
+
+        # 🌟 VIVIDのインターフェースに合わせてキーとメタデータを追加
+        # img_8bit_cropped のテンソル形状は [C, H, W]
+        h, w = dict_t['8bit'].shape[1:]
+        depth0_cropped = depth0[self.crop_top : h - self.crop_bottom, self.crop_left : w - self.crop_right] 
+        depth1_cropped = depth1[self.crop_top : h - self.crop_bottom, self.crop_left : w - self.crop_right] 
+
+        # LightGlueは orig_size として [Width, Height] の順のテンソルを要求する
+        orig_size = torch.tensor([w, h], dtype=torch.float32)
 
         # return {
-        #     'thr_t'  : self._read_thr(p_t),
-        #     'thr_t1' : self._read_thr(p_t1),
-        #     'T_rel'  : torch.from_numpy(T_rel).float(),
-        #     'K'      : torch.from_numpy(K).float(),
-        #     'valid'  : torch.tensor(True),
+        #     'image0':     dict_t['8bit'],       # 'thr_t' から変更
+        #     'image1':     dict_t1['8bit'],      # 'thr_t1' から変更
+        #     'orig_size0': orig_size,            # 🌟 新規追加必須
+        #     'orig_size1': orig_size,            # 🌟 新規追加必須
+        #     'T_rel':      torch.from_numpy(T_rel).float(),
+        #     'K':          torch.from_numpy(K_cropped).float(),
+        #     'valid':      torch.tensor(True),
+        #     # Rawデータも保持しておきたい場合は別キーで残す
+        #     'image0_raw': dict_t['raw'],
+        #     'image1_raw': dict_t1['raw'],
         # }
+        return {
+            'image0':     dict_t['8bit'],   
+            'image1':     dict_t1['8bit'],
+            'depth0':     torch.from_numpy(depth0_cropped).float(), # [1, H, W]
+            # 'depth1':     torch.from_numpy(depth1_cropped).float(), # [1, H, W]
+            'orig_size0': orig_size,        
+            'orig_size1': orig_size,        
+            'T_rel':      torch.from_numpy(T_rel).float(),
+            'K':          torch.from_numpy(K_cropped).float(),
+            'dataset_name': 'ms2'
+        }
     
-    def _read_dual_thr(self, path: str) -> dict:
-        """MS2: 16-bit Rawを読み込み、動的に黄金の前処理を適用"""
+    def _process_image(self, path: str) -> dict:
+        """16-bit Rawを読み込み、黄金の前処理とクロップを適用"""
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(f"[MS2Seq] not found: {path}")
@@ -1818,111 +2604,310 @@ class MS2SequentialDataset(Dataset):
         if img_float.ndim == 3:
             img_float = cv2.cvtColor(img_float, cv2.COLOR_BGR2GRAY)
 
-        # 1. 8-bit用の動的前処理 (hist_99)
+        # 1. hist_99 正規化
         im_srt = np.sort(img_float.reshape(-1))
         upper_bound = im_srt[round(len(im_srt) * 0.99) - 1]
         lower_bound = im_srt[round(len(im_srt) * 0.01)]
 
         img_norm = img_float.copy()
-        img_norm[img_norm < lower_bound] = lower_bound
-        img_norm[img_norm > upper_bound] = upper_bound
+        img_norm = np.clip(img_norm, lower_bound, upper_bound)
         
         if upper_bound - lower_bound > 1e-5:
             image_out = ((img_norm - lower_bound) / (upper_bound - lower_bound)) * 255.0
         else:
-            image_out = img_norm * 0
+            image_out = np.zeros_like(img_norm)
         image_out = image_out.astype(np.uint8)
 
         # 2. CLAHE + Bilateral
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        clahe_img = clahe.apply(image_out)
-        img_8bit_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
+        if self.apply_clahe:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            clahe_img = clahe.apply(image_out)
+            img_8bit_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
+        else:
+            img_8bit_final = image_out
 
-        # 3. Static Crop (8-bit と Raw 両方に全く同じCropを適用し空間を同期)
+        # デバッグ保存ロジック（安全にインスタンス変数を使用）
+        if self._debug_save_count < 10:
+            save_dir = "debug_ms2_preprocessed"
+            os.makedirs(save_dir, exist_ok=True)
+            original_name = os.path.basename(path)
+            save_path = os.path.join(save_dir, f"prep_{self._debug_save_count:02d}_{original_name}")
+            cv2.imwrite(save_path, img_8bit_final)
+            print(f"[DEBUG] MS2前処理画像を保存しました: {save_path}")
+            self._debug_save_count += 1
+
+        # 3. Static Crop
         h, w = img_float.shape[:2]
-        crop_top, crop_bottom = 9, 35
-        crop_left, crop_right = 28, 34
-        
-        img_8bit_cropped = img_8bit_final[crop_top:h - crop_bottom, crop_left:w - crop_right]
-        img_raw_cropped = img_float[crop_top:h - crop_bottom, crop_left:w - crop_right]
+        img_8bit_cropped = img_8bit_final[self.crop_top : h - self.crop_bottom, self.crop_left : w - self.crop_right]
+        img_raw_cropped  = img_float[self.crop_top : h - self.crop_bottom, self.crop_left : w - self.crop_right]
 
-        # テンソル化
+        # テンソル化 (XFeat用に3ch化)
         img_8bit_rgb = cv2.cvtColor(img_8bit_cropped, cv2.COLOR_GRAY2RGB)
         t_8bit = torch.from_numpy(img_8bit_rgb).permute(2, 0, 1).float() / 255.0
-        
-        # Rawは1チャンネルのまま保持（正規化しない）
         t_raw = torch.from_numpy(img_raw_cropped).unsqueeze(0).float()
 
         return {'8bit': t_8bit, 'raw': t_raw}
 
-    global _DEBUG_MS2_SAVE_COUNT
-    _DEBUG_MS2_SAVE_COUNT = 10
+# class MS2SequentialDataset(Dataset):
+#     """
+#     MS2 データセットの連続フレームペア + GT 相対姿勢。
 
-    def _read_thr(self, path: str) -> Tensor:
-        global _DEBUG_MS2_SAVE_COUNT
+#     GT ポーズ:
+#         odom/{seq}/thr/*.txt  ← 熱画像カメラのオドメトリ・タイムスタンプ
+#         実際のファイル名はシーケンスによって異なる場合がある。
+#         odom_thr.txt または *.txt の最初のファイルを使用する。
+#     画像:
+#         sync_data/{seq}/thr/img_left/*.png
+#         → hist_99 + bilateral 前処理済み
+
+#     前処理の注意:
+#         MS2 は hist_99（99パーセンタイル正規化）+ bilateral フィルタを使用。
+#         SThErEO/VIVID は CLAHE を使用。
+#         → MS2 の画像は CLAHE をオプションで追加適用して統一可能。
+#         → apply_clahe=True（デフォルト）で SThErEO と前処理を統一。
+
+#     Args:
+#         data_root:         MS2 ルートディレクトリ
+#         stride:            フレーム間隔（推奨: 3-5）
+#         split:             'train' | 'val' | 'all'
+#         max_pairs_per_seq: 1シーケンスあたりの最大ペア数
+#         apply_clahe:       True=CLAHE 追加適用（SThErEO との前処理統一）
+#         clahe_clip_range:  CLAHE clipLimit のランダム範囲 (min, max)
+#     """
+
+#     def __init__(
+#         self,
+#         data_root:         str,
+#         stride:            int = 3,
+#         split:             str = 'all',
+#         max_pairs_per_seq: int = 2000,
+#         apply_clahe:       bool = True,
+#         clahe_clip_range:  tuple = (1.5, 3.0),
+#     ):
+#         self.data_root       = data_root
+#         self.stride          = stride
+#         self.apply_clahe     = apply_clahe
+#         self.clahe_clip_range = clahe_clip_range
+#         self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
+
+#         if split == 'all':
+#             seqs = _MS2_TRAIN_SEQS + _MS2_VAL_SEQS
+#         elif split == 'train':
+#             seqs = _MS2_TRAIN_SEQS
+#         else:
+#             seqs = _MS2_VAL_SEQS
+
+#         sync_root = os.path.join(data_root, 'sync_data')
+#         odom_root = os.path.join(data_root, 'odom')
+
+#         for seq_name in seqs:
+#             # 画像: sync_data/{seq}/thr/img_left/{idx:06d}.png
+#             thr_img_dir  = os.path.join(sync_root, seq_name, 'thr', 'img_left')
+#             # pose:  odom/{seq}/thr/{idx:06d}.txt （フレームごとに個別ファイル）
+#             thr_pose_dir = os.path.join(odom_root,  seq_name, 'thr')
+
+#             if not os.path.isdir(thr_img_dir):
+#                 continue
+#             if not os.path.isdir(thr_pose_dir):
+#                 print(f"[MS2Seq] {seq_name}: pose dir なし → skip")
+#                 continue
+
+#             # 画像ファイル一覧（インデックス順）
+#             img_files = sorted(
+#                 f for f in os.listdir(thr_img_dir) if f.endswith('.png'))
+#             if len(img_files) < 2:
+#                 continue
+
+#             # フレームインデックスで画像と pose を直接対応付け
+#             # 000668.png ↔ 000668.txt（タイムスタンプ照合不要）
+#             matched = []
+#             for fname in img_files:
+#                 stem      = fname.rsplit('.', 1)[0]   # '000668'
+#                 pose_path = os.path.join(thr_pose_dir, stem + '.txt')
+#                 T = _load_ms2_frame_pose(pose_path)
+#                 if T is not None:
+#                     matched.append((
+#                         os.path.join(thr_img_dir, fname), T))
+
+#             if len(matched) < 2:
+#                 print(f"[MS2Seq] {seq_name}: matched={len(matched)} → skip")
+#                 continue
+
+#             # stride でペアを構築
+#             calib_path = os.path.join(sync_root, seq_name, 'calib.npy')
+#             K = _load_ms2_K(calib_path)
+
+#             n_added = 0
+#             # for i in range(0, len(matched) - stride, stride):
+#             #     j = i + stride
+#             #     p_t,  T_t  = matched[i]
+#             #     p_t1, T_t1 = matched[j]
+#             #     T_rel = np.linalg.inv(T_t) @ T_t1
+#             #     if np.linalg.norm(T_rel[:3, 3]) < 0.01:
+#             #         continue
+#             #     # 読み込んだK行列をペア情報として保存
+#             #     self._pairs.append((p_t, p_t1, T_rel, K))
+#             for i in range(0, len(matched) - stride, stride):
+#                 j = i + stride
+#                 p_t,  T_t  = matched[i]
+#                 p_t1, T_t1 = matched[j]
+#                 T_rel = np.linalg.inv(T_t) @ T_t1
+                
+#                 # --- ここを 0.01 から 0.5 に変更 ---
+#                 if np.linalg.norm(T_rel[:3, 3]) < 0.5:
+#                     continue
+#                 # -----------------------------------
+                
+#                 self._pairs.append((p_t, p_t1, T_rel, K))
+#                 n_added += 1
+#                 if n_added >= max_pairs_per_seq:
+#                     break
+
+#             print(f"[MS2Seq] {seq_name}: {n_added} pairs (stride={stride})")
+
+#     def __len__(self) -> int:
+#         return len(self._pairs)
+
+#     def __getitem__(self, idx: int) -> Dict:
+#         p_t, p_t1, T_rel, K = self._pairs[idx]
+
+#         # dual thermal tensor
+#         data_t  = self._read_dual_thr(p_t)
+#         data_t1 = self._read_dual_thr(p_t1)
+
+#         return {
+#             'thr_t_8bit': dict_t['8bit'],
+#             'thr_t_raw': dict_t['raw'],
+#             'thr_t1_8bit': dict_t1['8bit'],
+#             'thr_t1_raw': dict_t1['raw'],
+#             'T_rel': torch.from_numpy(T_rel).float(),
+#             'K': torch.from_numpy(K).float(),
+#             'valid': torch.tensor(True),
+#         }
+
+#         # return {
+#         #     'thr_t'  : self._read_thr(p_t),
+#         #     'thr_t1' : self._read_thr(p_t1),
+#         #     'T_rel'  : torch.from_numpy(T_rel).float(),
+#         #     'K'      : torch.from_numpy(K).float(),
+#         #     'valid'  : torch.tensor(True),
+#         # }
+    
+#     def _read_dual_thr(self, path: str) -> dict:
+#         """MS2: 16-bit Rawを読み込み、動的に黄金の前処理を適用"""
+#         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+#         if img is None:
+#             raise FileNotFoundError(f"[MS2Seq] not found: {path}")
+
+#         img_float = img.astype(np.float32)
+#         if img_float.ndim == 3:
+#             img_float = cv2.cvtColor(img_float, cv2.COLOR_BGR2GRAY)
+
+#         # 1. 8-bit用の動的前処理 (hist_99)
+#         im_srt = np.sort(img_float.reshape(-1))
+#         upper_bound = im_srt[round(len(im_srt) * 0.99) - 1]
+#         lower_bound = im_srt[round(len(im_srt) * 0.01)]
+
+#         img_norm = img_float.copy()
+#         img_norm[img_norm < lower_bound] = lower_bound
+#         img_norm[img_norm > upper_bound] = upper_bound
         
-        # 1. RAW読み込み (8-bitダウンキャストを防ぎ、16-bit等の生データを保持)
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise FileNotFoundError(f"[MS2Seq] not found: {path}")
+#         if upper_bound - lower_bound > 1e-5:
+#             image_out = ((img_norm - lower_bound) / (upper_bound - lower_bound)) * 255.0
+#         else:
+#             image_out = img_norm * 0
+#         image_out = image_out.astype(np.uint8)
 
-        img_float = img.astype(np.float32)
-        if img_float.ndim == 3:
-            img_float = cv2.cvtColor(img_float, cv2.COLOR_BGR2GRAY)
-            
-        # ==========================================================
-        # 【正しい前処理 1】 hist_99 (1%〜99%パーセンタイル正規化)
-        # ==========================================================
-        im_srt = np.sort(img_float.reshape(-1))
-        upper_bound = im_srt[round(len(im_srt) * 0.99) - 1]
-        lower_bound = im_srt[round(len(im_srt) * 0.01)]
+#         # 2. CLAHE + Bilateral
+#         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+#         clahe_img = clahe.apply(image_out)
+#         img_8bit_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
 
-        img_float[img_float < lower_bound] = lower_bound
-        img_float[img_float > upper_bound] = upper_bound
+#         # 3. Static Crop (8-bit と Raw 両方に全く同じCropを適用し空間を同期)
+#         h, w = img_float.shape[:2]
+#         crop_top, crop_bottom = 9, 35
+#         crop_left, crop_right = 28, 34
         
-        if upper_bound - lower_bound > 1e-5:
-            image_out = ((img_float - lower_bound) / (upper_bound - lower_bound)) * 255.0
-        else:
-            image_out = img_float * 0
+#         img_8bit_cropped = img_8bit_final[crop_top:h - crop_bottom, crop_left:w - crop_right]
+#         img_raw_cropped = img_float[crop_top:h - crop_bottom, crop_left:w - crop_right]
+
+#         # テンソル化
+#         img_8bit_rgb = cv2.cvtColor(img_8bit_cropped, cv2.COLOR_GRAY2RGB)
+#         t_8bit = torch.from_numpy(img_8bit_rgb).permute(2, 0, 1).float() / 255.0
+        
+#         # Rawは1チャンネルのまま保持（正規化しない）
+#         t_raw = torch.from_numpy(img_raw_cropped).unsqueeze(0).float()
+
+#         return {'8bit': t_8bit, 'raw': t_raw}
+
+#     global _DEBUG_MS2_SAVE_COUNT
+#     _DEBUG_MS2_SAVE_COUNT = 10
+
+#     def _read_thr(self, path: str) -> Tensor:
+#         global _DEBUG_MS2_SAVE_COUNT
+        
+#         # 1. RAW読み込み (8-bitダウンキャストを防ぎ、16-bit等の生データを保持)
+#         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+#         if img is None:
+#             raise FileNotFoundError(f"[MS2Seq] not found: {path}")
+
+#         img_float = img.astype(np.float32)
+#         if img_float.ndim == 3:
+#             img_float = cv2.cvtColor(img_float, cv2.COLOR_BGR2GRAY)
             
-        image_out = image_out.astype(np.uint8)
+#         # ==========================================================
+#         # 【正しい前処理 1】 hist_99 (1%〜99%パーセンタイル正規化)
+#         # ==========================================================
+#         im_srt = np.sort(img_float.reshape(-1))
+#         upper_bound = im_srt[round(len(im_srt) * 0.99) - 1]
+#         lower_bound = im_srt[round(len(im_srt) * 0.01)]
 
-        # ==========================================================
-        # 【正しい前処理 2】 enhance_image (CLAHE + Bilateral Filter)
-        # ==========================================================
-        # MS2の評価時は、パラメータをランダム化せず AnyThermal 固定値を使用
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        clahe_img = clahe.apply(image_out)
-        # ノイズを平滑化しつつエッジを保持
-        img_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
-
-        # ==========================================================
-        # 【正しい前処理 3】 crop (静的ノイズ領域：自車の枠の切り抜き)
-        # ==========================================================
-        h, w = img_final.shape[:2]
-        crop_top, crop_bottom = 9, 35
-        crop_left, crop_right = 28, 34
-        img_final = img_final[crop_top:h - crop_bottom, crop_left:w - crop_right]
-
-        # ----------------------------------------------------------
-        # デバッグ用：前処理が完了した画像を最初の10枚だけディスクに保存
-        # ----------------------------------------------------------
-        if _DEBUG_MS2_SAVE_COUNT < 10:
-            save_dir = "debug_ms2_preprocessed"
-            os.makedirs(save_dir, exist_ok=True)
+#         img_float[img_float < lower_bound] = lower_bound
+#         img_float[img_float > upper_bound] = upper_bound
+        
+#         if upper_bound - lower_bound > 1e-5:
+#             image_out = ((img_float - lower_bound) / (upper_bound - lower_bound)) * 255.0
+#         else:
+#             image_out = img_float * 0
             
-            # 元のファイル名を取得して保存名にする
-            original_name = os.path.basename(path)
-            save_path = os.path.join(save_dir, f"prep_{_DEBUG_MS2_SAVE_COUNT:02d}_{original_name}")
-            
-            cv2.imwrite(save_path, img_final)
-            print(f"[DEBUG] MS2前処理確認用画像を保存しました: {save_path}")
-            _DEBUG_MS2_SAVE_COUNT += 1
-        # ----------------------------------------------------------
+#         image_out = image_out.astype(np.uint8)
 
-        # XFeatに入力するため、3チャンネル化してテンソル(0.0~1.0)に変換
-        img_final = cv2.cvtColor(img_final, cv2.COLOR_GRAY2RGB)
-        return torch.from_numpy(img_final).permute(2, 0, 1).float() / 255.0
+#         # ==========================================================
+#         # 【正しい前処理 2】 enhance_image (CLAHE + Bilateral Filter)
+#         # ==========================================================
+#         # MS2の評価時は、パラメータをランダム化せず AnyThermal 固定値を使用
+#         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+#         clahe_img = clahe.apply(image_out)
+#         # ノイズを平滑化しつつエッジを保持
+#         img_final = cv2.bilateralFilter(clahe_img, 5, 20, 15)
+
+#         # ==========================================================
+#         # 【正しい前処理 3】 crop (静的ノイズ領域：自車の枠の切り抜き)
+#         # ==========================================================
+#         h, w = img_final.shape[:2]
+#         crop_top, crop_bottom = 9, 35
+#         crop_left, crop_right = 28, 34
+#         img_final = img_final[crop_top:h - crop_bottom, crop_left:w - crop_right]
+
+#         # ----------------------------------------------------------
+#         # デバッグ用：前処理が完了した画像を最初の10枚だけディスクに保存
+#         # ----------------------------------------------------------
+#         if _DEBUG_MS2_SAVE_COUNT < 10:
+#             save_dir = "debug_ms2_preprocessed"
+#             os.makedirs(save_dir, exist_ok=True)
+            
+#             # 元のファイル名を取得して保存名にする
+#             original_name = os.path.basename(path)
+#             save_path = os.path.join(save_dir, f"prep_{_DEBUG_MS2_SAVE_COUNT:02d}_{original_name}")
+            
+#             cv2.imwrite(save_path, img_final)
+#             print(f"[DEBUG] MS2前処理確認用画像を保存しました: {save_path}")
+#             _DEBUG_MS2_SAVE_COUNT += 1
+#         # ----------------------------------------------------------
+
+#         # XFeatに入力するため、3チャンネル化してテンソル(0.0~1.0)に変換
+#         img_final = cv2.cvtColor(img_final, cv2.COLOR_GRAY2RGB)
+#         return torch.from_numpy(img_final).permute(2, 0, 1).float() / 255.0
     
     # def _read_dual_thr(self, path: str) -> dict:
     #     """

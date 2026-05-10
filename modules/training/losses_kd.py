@@ -511,3 +511,64 @@ def thermal_gradient_loss(
     scores_norm = scores / (scores.sum() + 1e-8)
     expected_grad = (scores_norm * grad_at_kpts).sum()
     return 1.0 - expected_grad
+
+# modules/training/losses_kd.py に追加
+def hybrid_thermal_gradient_loss(
+    kpts: torch.Tensor,
+    scores: torch.Tensor,
+    img_thr_raw: torch.Tensor,
+    bit_depth: int = 16,
+    tau_fixed: float = 200.0  # 16-bit時の固定物理閾値 (DN単位)
+) -> torch.Tensor:
+    """
+    物理モデルベースのハイブリッド熱勾配損失。
+    Rawテンソルを用いて、真の温度勾配にキーポイントを誘導する。
+    
+    Args:
+        kpts: (N, 2) キーポイント座標 [x, y]
+        scores: (N,) 検出スコア
+        img_thr_raw: (1, 1, H, W) 正規化されていないRaw熱画像テンソル
+        bit_depth: センサのビット深度
+        tau_fixed: bit_depth > 8 の場合に使用するノイズフロア閾値
+    """
+    if len(kpts) == 0 or img_thr_raw is None:
+        return kpts.new_zeros(1).squeeze()
+
+    B, C, H, W = img_thr_raw.shape
+
+    with torch.no_grad():
+        # Raw画像からSobel勾配を計算 (1ch前提)
+        sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=img_thr_raw.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=img_thr_raw.device).view(1, 1, 3, 3)
+        
+        gx = F.conv2d(img_thr_raw, sobel_x, padding=1)
+        gy = F.conv2d(img_thr_raw, sobel_y, padding=1)
+        grad_mag = (gx ** 2 + gy ** 2).sqrt().squeeze()  # (H, W)
+
+        # 物理閾値 (Tau) の適用
+        if bit_depth > 8:
+            # 16-bit等: 固定のセンサノイズフロア以下をSoftplusで滑らかにカット
+            grad_mag = F.softplus(grad_mag - tau_fixed)
+        else:
+            # 8-bit等: 動的閾値 (中央値の2倍) を使用
+            median_val = torch.median(grad_mag)
+            tau_adaptive = median_val * 2.0
+            grad_mag = F.softplus(grad_mag - tau_adaptive)
+
+        # [0, 1] に再正規化し、確率分布として扱う準備
+        grad_mag = grad_mag / (grad_mag.max() + 1e-8)
+
+    # KP位置での真の物理勾配をサンプリング
+    kx = kpts[:, 0].clamp(0, W - 1).long()
+    ky = kpts[:, 1].clamp(0, H - 1).long()
+    grad_at_kpts = grad_mag[ky, kx]
+
+    # NLL (Negative Log-Likelihood) 的なアプローチ
+    # 「勾配が大きい場所＝真の温度境界」にKPスコアが集中するように学習
+    scores_norm = scores / (scores.sum() + 1e-8)
+    expected_grad = (scores_norm * grad_at_kpts).sum()
+    
+    # 期待される勾配が大きいほどLossが下がる
+    loss = 1.0 - expected_grad
+    return loss
+

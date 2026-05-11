@@ -5,3 +5,9 @@
 [submodule "third_party/anythermal"]
 	path = third_party/anythermal
 	url = https://github.com/castacks/AnyThermal
+[submodule "third_party/gluestick"]
+	path = third_party/gluestick
+	url = https://github.com/cvg/GlueStick.git
+[submodule "third_party/lightgluestick"]
+	path = third_party/lightgluestick
+	url = https://github.com/aubingazhib/LightGlueStick.git

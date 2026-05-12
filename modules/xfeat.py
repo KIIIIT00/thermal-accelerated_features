@@ -38,7 +38,7 @@ class XFeat(nn.Module):
 				self.net.load_state_dict(weights)
 
 		self.interpolator = InterpolateSparse2d('bicubic')
-  		self.net = torch.compile(self.net)
+		self.net = torch.compile(self.net)
 
 		#Try to import LightGlue from Kornia
 		self.kornia_available = False
@@ -103,7 +103,9 @@ class XFeat(nn.Module):
 		return [  
 				   {'keypoints': mkpts[b][valid[b]],
 					'scores': scores[b][valid[b]],
-					'descriptors': feats[b][valid[b]]} for b in range(B) 
+					'descriptors': feats[b][valid[b]],
+					'dense_descriptors': M1[b]  # densce map
+				   } for b in range(B)
 			   ]
 
 	@torch.inference_mode()

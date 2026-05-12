@@ -2447,6 +2447,188 @@ def _load_ms2_K(calib_path: str) -> np.ndarray:
     # 失敗した時のみデフォルトを使用
     return _MS2_K_DEFAULT.copy()
 
+# class MS2SequentialDataset(Dataset):
+#     """
+#     MS2 データセットの連続フレームペア + GT 相対姿勢。
+#     """
+#     def __init__(
+#         self,
+#         data_root: str,
+#         stride: int = 3,
+#         split: str = 'all',
+#         max_pairs_per_seq: int = 2000,
+#         apply_clahe: bool = True,
+#         min_translation: float = 0.5, # マジックナンバーを引数化
+#     ):
+#         self.data_root = data_root
+#         self.stride = stride
+#         self.apply_clahe = apply_clahe
+#         self.min_translation = min_translation
+#         self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
+        
+#         # デバッグ用のカウントをインスタンス変数で安全に管理
+#         self._debug_save_count = 0 
+
+#         # --- クロップの固定値 ---
+#         self.crop_top = 9
+#         self.crop_bottom = 35
+#         self.crop_left = 28
+#         self.crop_right = 34
+
+#         if split == 'all':
+#             seqs = _MS2_TRAIN_SEQS + _MS2_VAL_SEQS
+#         elif split == 'train':
+#             seqs = _MS2_TRAIN_SEQS
+#         else:
+#             seqs = _MS2_VAL_SEQS
+
+#         sync_root = os.path.join(data_root, 'sync_data')
+#         odom_root = os.path.join(data_root, 'odom')
+
+#         for seq_name in seqs:
+#             thr_img_dir  = os.path.join(sync_root, seq_name, 'thr', 'img_left')
+#             thr_pose_dir = os.path.join(odom_root,  seq_name, 'thr')
+
+#             if not os.path.isdir(thr_img_dir) or not os.path.isdir(thr_pose_dir):
+#                 print(f"[MS2Seq] {seq_name}: dirs missing → skip")
+#                 continue
+
+#             img_files = sorted(f for f in os.listdir(thr_img_dir) if f.endswith('.png'))
+            
+#             matched = []
+#             for fname in img_files:
+#                 stem = fname.rsplit('.', 1)[0]
+#                 pose_path = os.path.join(thr_pose_dir, stem + '.txt')
+#                 # Depth Pase
+#                 # depth_path = os.path.join(self.data_root, 'proj_depth', seq_name, 'thr', 'depth_filtered', stem + '.png')
+#                 depth_path = os.path.join(self.data_root, 'proj_depth', seq_name, 'thr', 'depth', stem + '.png')
+#                 T = _load_ms2_frame_pose(pose_path)
+#                 if T is not None and os.path.exists(depth_path):
+#                     matched.append((os.path.join(thr_img_dir, fname), T, depth_path))
+
+#             if len(matched) < 2:
+#                 continue
+
+#             calib_path = os.path.join(sync_root, seq_name, 'calib.npy')
+#             K = _load_ms2_K(calib_path)
+
+#             n_added = 0
+#             for i in range(0, len(matched) - self.stride, self.stride):
+#                 j = i + self.stride
+#                 p_t,  T_t, depth_path0  = matched[i]
+#                 p_t1, T_t1, depth_path1 = matched[j]
+                
+#                 T_rel_native = np.linalg.inv(T_t) @ T_t1
+                
+#                 # T_rel = np.linalg.inv(T_t) @ T_t1
+#                 T_rel_native = np.linalg.inv(T_rel_native)
+
+#                 T_conv = np.array([
+#                     [ 0.0,  0.0,  1.0,  0.0],  # CVのX = ネイティブのZ
+#                     [ 0.0,  1.0,  0.0,  0.0],  # CVのY = ネイティブのY (そのまま)
+#                     [ 1.0,  0.0,  0.0,  0.0],  # CVのZ = ネイティブのX
+#                     [ 0.0,  0.0,  0.0,  1.0]
+#                 ], dtype=np.float64)
+                
+#                 # 3. 相似変換の適用
+#                 T_rel = T_conv @ T_rel_native @ np.linalg.inv(T_conv)
+                
+#                 # 並進フィルタ
+#                 if np.linalg.norm(T_rel[:3, 3]) < self.min_translation:
+#                     continue
+                
+#                 self._pairs.append((p_t, p_t1, T_rel, K, depth_path0, depth_path1))
+#                 n_added += 1
+#                 if n_added >= max_pairs_per_seq:
+#                     break
+
+#             print(f"[MS2Seq] {seq_name}: {n_added} pairs (stride={stride})")
+
+#     def __len__(self) -> int:
+#         return len(self._pairs)
+
+#     def __getitem__(self, idx: int) -> Dict:
+#         p_t, p_t1, T_rel, K_orig, depth_path0, depth_path1 = self._pairs[idx]
+
+#         dict_t  = self._process_image(p_t)
+#         dict_t1 = self._process_image(p_t1)
+        
+#         # depth load
+#         depth0 = cv2.imread(depth_path0, cv2.IMREAD_UNCHANGED).astype(np.float32) / 256.0
+#         depth1 = cv2.imread(depth_path1, cv2.IMREAD_UNCHANGED).astype(np.float32) / 256.0
+
+#         K_cropped = K_orig.copy()
+#         K_cropped[0, 2] -= self.crop_left
+#         K_cropped[1, 2] -= self.crop_top
+
+#         # 🌟 VIVIDのインターフェースに合わせてキーとメタデータを追加
+#         # img_8bit_cropped のテンソル形状は [C, H, W]
+#         h, w = dict_t['8bit'].shape[1:]
+#         depth0_cropped = depth0[self.crop_top : h - self.crop_bottom, self.crop_left : w - self.crop_right] 
+#         depth1_cropped = depth1[self.crop_top : h - self.crop_bottom, self.crop_left : w - self.crop_right] 
+
+#         # LightGlueは orig_size として [Width, Height] の順のテンソルを要求する
+#         orig_size = torch.tensor([w, h], dtype=torch.float32)
+
+#         # return {
+#         #     'image0':     dict_t['8bit'],       # 'thr_t' から変更
+#         #     'image1':     dict_t1['8bit'],      # 'thr_t1' から変更
+#         #     'orig_size0': orig_size,            # 🌟 新規追加必須
+#         #     'orig_size1': orig_size,            # 🌟 新規追加必須
+#         #     'T_rel':      torch.from_numpy(T_rel).float(),
+#         #     'K':          torch.from_numpy(K_cropped).float(),
+#         #     'valid':      torch.tensor(True),
+#         #     # Rawデータも保持しておきたい場合は別キーで残す
+#         #     'image0_raw': dict_t['raw'],
+#         #     'image1_raw': dict_t1['raw'],
+#         # }
+#         return {
+#             'image0':     dict_t['8bit'],   
+#             'image1':     dict_t1['8bit'],
+#             'depth0':     torch.from_numpy(depth0_cropped).float(), # [1, H, W]
+#             # 'depth1':     torch.from_numpy(depth1_cropped).float(), # [1, H, W]
+#             'orig_size0': orig_size,        
+#             'orig_size1': orig_size,        
+#             'T_rel':      torch.from_numpy(T_rel).float(),
+#             'K':          torch.from_numpy(K_cropped).float(),
+#             'dataset_name': 'ms2'
+#         }
+
+def _load_ms2_calib_full(calib_path: str):
+    """
+    calib.npy から K行列、整流行列、および LiDAR -> Thermal の外部パラメータを読み込む
+    """
+    if not os.path.isfile(calib_path):
+        raise FileNotFoundError(f"Calibration file not found: {calib_path}")
+        
+    calib = np.load(calib_path, allow_pickle=True).item()
+
+    def get_mat(rot_key, trans_key):
+        R = np.array(calib[rot_key], dtype=np.float64).reshape(3, 3)
+        # 単位はミリメートル(mm)なのでメートル(m)に変換
+        T = np.array(calib[trans_key], dtype=np.float64).reshape(3, 1) / 1000.0
+        Mat = np.eye(4, dtype=np.float64)
+        Mat[:3, :3] = R
+        Mat[:3, 3:] = T
+        return Mat
+
+    # 1. 内部パラメータ
+    K_thrL = np.array(calib['K_thrL'], dtype=np.float64).reshape(3, 3)
+    
+    # 2. 整流行列 (Unrectified -> Rectified への変換)
+    T_rect_thr = get_mat('R_thrL', 'T_thrL')
+    
+    # 3. センサー間外部パラメータ (NIR基準)
+    T_nir_to_thr = get_mat('R_nir2thr', 'T_nir2thr')
+    T_nir_to_lidar = get_mat('R_nir2lidarL', 'T_nir2lidarL')
+    
+    # 4. LiDAR から Thermal への直接変換行列を計算
+    # P_lidar = T_nir_to_lidar * P_nir  =>  P_nir = inv(T_nir_to_lidar) * P_lidar
+    # P_thr = T_nir_to_thr * P_nir      =>  P_thr = T_nir_to_thr * inv(T_nir_to_lidar) * P_lidar
+    T_lidar_to_thr = T_nir_to_thr @ np.linalg.inv(T_nir_to_lidar)
+
+    return K_thrL, T_rect_thr, T_lidar_to_thr
+
 class MS2SequentialDataset(Dataset):
     """
     MS2 データセットの連続フレームペア + GT 相対姿勢。
@@ -2458,15 +2640,14 @@ class MS2SequentialDataset(Dataset):
         split: str = 'all',
         max_pairs_per_seq: int = 2000,
         apply_clahe: bool = True,
-        min_translation: float = 0.5, # マジックナンバーを引数化
+        min_translation: float = 0.5,
     ):
         self.data_root = data_root
         self.stride = stride
         self.apply_clahe = apply_clahe
         self.min_translation = min_translation
-        self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
+        self._pairs: List[Tuple[str, str, np.ndarray, np.ndarray, str, str]] = []
         
-        # デバッグ用のカウントをインスタンス変数で安全に管理
         self._debug_save_count = 0 
 
         # --- クロップの固定値 ---
@@ -2485,12 +2666,21 @@ class MS2SequentialDataset(Dataset):
         sync_root = os.path.join(data_root, 'sync_data')
         odom_root = os.path.join(data_root, 'odom')
 
+        # 正しい変換行列: 車両(Body) -> カメラ(Camera)
+        # X_c = X_b(右), Y_c = -Z_b(下), Z_c = Y_b(前)
+        T_body_to_cam = np.array([
+            [ 1.0,  0.0,  0.0,  0.0],
+            [ 0.0,  0.0, -1.0,  0.0],
+            [ 0.0,  1.0,  0.0,  0.0],
+            [ 0.0,  0.0,  0.0,  1.0]
+        ], dtype=np.float64)
+        T_cam_to_body = np.linalg.inv(T_body_to_cam)
+
         for seq_name in seqs:
             thr_img_dir  = os.path.join(sync_root, seq_name, 'thr', 'img_left')
             thr_pose_dir = os.path.join(odom_root,  seq_name, 'thr')
 
             if not os.path.isdir(thr_img_dir) or not os.path.isdir(thr_pose_dir):
-                print(f"[MS2Seq] {seq_name}: dirs missing → skip")
                 continue
 
             img_files = sorted(f for f in os.listdir(thr_img_dir) if f.endswith('.png'))
@@ -2499,9 +2689,8 @@ class MS2SequentialDataset(Dataset):
             for fname in img_files:
                 stem = fname.rsplit('.', 1)[0]
                 pose_path = os.path.join(thr_pose_dir, stem + '.txt')
-                # Depth Pase
-                # depth_path = os.path.join(self.data_root, 'proj_depth', seq_name, 'thr', 'depth_filtered', stem + '.png')
                 depth_path = os.path.join(self.data_root, 'proj_depth', seq_name, 'thr', 'depth', stem + '.png')
+                
                 T = _load_ms2_frame_pose(pose_path)
                 if T is not None and os.path.exists(depth_path):
                     matched.append((os.path.join(thr_img_dir, fname), T, depth_path))
@@ -2513,31 +2702,53 @@ class MS2SequentialDataset(Dataset):
             K = _load_ms2_K(calib_path)
 
             n_added = 0
+            calib_path = os.path.join(sync_root, seq_name, 'calib.npy')
+            calib = np.load(calib_path, allow_pickle=True).item()
+
+            R_thrL = np.array(calib['R_thrL'], dtype=np.float64).reshape(3, 3)
+            T_rect = np.eye(4, dtype=np.float64)
+            T_rect[:3, :3] = R_thrL
+
+            K_orig, T_rect_thr, T_lidar_to_thr = _load_ms2_calib_full(calib_path)
+            T_thr_to_lidar = np.linalg.inv(T_lidar_to_thr)
+
+            n_added = 0
             for i in range(0, len(matched) - self.stride, self.stride):
                 j = i + self.stride
-                p_t,  T_t, depth_path0  = matched[i]
-                p_t1, T_t1, depth_path1 = matched[j]
+                p_t,  T_pose_0, depth_path0  = matched[i]
+                p_t1, T_pose_1, depth_path1 = matched[j]
                 
-                T_rel_native = np.linalg.inv(T_t) @ T_t1
+                # 【重要】もし odom の軌跡が LiDAR の基準点で計算されている場合、
+                # 軌跡の原点を Thermal カメラ（未整流）の原点に変換する
+                # T_world_to_thr = T_world_to_lidar * T_lidar_to_thr
+                # T_world_to_thr_0 = T_pose_0 @ T_thr_to_lidar
+                # T_world_to_thr_1 = T_pose_1 @ T_thr_to_lidar
                 
-                # T_rel = np.linalg.inv(T_t) @ T_t1
-                T_rel_native = np.linalg.inv(T_rel_native)
-
-                T_conv = np.array([
-                    [ 0.0,  0.0,  1.0,  0.0],  # CVのX = ネイティブのZ
-                    [ 0.0,  1.0,  0.0,  0.0],  # CVのY = ネイティブのY (そのまま)
-                    [ 1.0,  0.0,  0.0,  0.0],  # CVのZ = ネイティブのX
-                    [ 0.0,  0.0,  0.0,  1.0]
-                ], dtype=np.float64)
+                # # 1. 未整流 (Unrectified) Thermalカメラ間の相対姿勢
+                # # T_rel_unrect = inv(T_1) * T_0
+                # T_rel_unrect = np.linalg.inv(T_world_to_thr_1) @ T_world_to_thr_0
                 
-                # 3. 相似変換の適用
-                T_rel = T_conv @ T_rel_native @ np.linalg.inv(T_conv)
+                # # 2. 整流 (Rectified) 空間への引き込み（Similarity Transform）
+                # # P_rect = T_rect * P_unrect の関係から、相対姿勢を Conjugation する
+                # T_rel_rect = T_rect_thr @ T_rel_unrect @ np.linalg.inv(T_rect_thr)
                 
-                # 並進フィルタ
-                if np.linalg.norm(T_rel[:3, 3]) < self.min_translation:
+                # # 並進フィルタ (整流カメラ座標系での移動量で判定)
+                # if np.linalg.norm(T_rel_rect[:3, 3]) < self.min_translation:
+                #     continue
+                
+                # self._pairs.append((p_t, p_t1, T_rel_rect, K_orig, depth_path0, depth_path1))
+                T_rel_unrect = np.linalg.inv(T_pose_1) @ T_pose_0
+    
+                # 【最重要】整流空間(Rectified)への相似変換
+                # P_rect = T_rect * P_unrect なので、
+                # 動きも T_rect で挟み込む
+                T_rel_rect = T_rect @ T_rel_unrect @ np.linalg.inv(T_rect)
+                
+                # 並進フィルタ等は T_rel_rect を使用
+                if np.linalg.norm(T_rel_rect[:3, 3]) < self.min_translation:
                     continue
                 
-                self._pairs.append((p_t, p_t1, T_rel, K, depth_path0, depth_path1))
+                self._pairs.append((p_t, p_t1, T_rel_rect, K, depth_path0, depth_path1))
                 n_added += 1
                 if n_added >= max_pairs_per_seq:
                     break
@@ -2555,38 +2766,25 @@ class MS2SequentialDataset(Dataset):
         
         # depth load
         depth0 = cv2.imread(depth_path0, cv2.IMREAD_UNCHANGED).astype(np.float32) / 256.0
-        depth1 = cv2.imread(depth_path1, cv2.IMREAD_UNCHANGED).astype(np.float32) / 256.0
+        # depth1 = cv2.imread(depth_path1, cv2.IMREAD_UNCHANGED).astype(np.float32) / 256.0
 
+        # クロップ後のK行列
         K_cropped = K_orig.copy()
         K_cropped[0, 2] -= self.crop_left
         K_cropped[1, 2] -= self.crop_top
 
-        # 🌟 VIVIDのインターフェースに合わせてキーとメタデータを追加
-        # img_8bit_cropped のテンソル形状は [C, H, W]
-        h, w = dict_t['8bit'].shape[1:]
-        depth0_cropped = depth0[self.crop_top : h - self.crop_bottom, self.crop_left : w - self.crop_right] 
-        depth1_cropped = depth1[self.crop_top : h - self.crop_bottom, self.crop_left : w - self.crop_right] 
+        # 🌟 修正ポイント: depthのクロップは「クロップ前の元の形状(H_orig, W_orig)」基準で行う
+        H_orig, W_orig = depth0.shape[:2]
+        depth0_cropped = depth0[self.crop_top : H_orig - self.crop_bottom, self.crop_left : W_orig - self.crop_right] 
+        # depth1_cropped = depth1[self.crop_top : H_orig - self.crop_bottom, self.crop_left : W_orig - self.crop_right] 
 
-        # LightGlueは orig_size として [Width, Height] の順のテンソルを要求する
+        h, w = dict_t['8bit'].shape[1:]
         orig_size = torch.tensor([w, h], dtype=torch.float32)
 
-        # return {
-        #     'image0':     dict_t['8bit'],       # 'thr_t' から変更
-        #     'image1':     dict_t1['8bit'],      # 'thr_t1' から変更
-        #     'orig_size0': orig_size,            # 🌟 新規追加必須
-        #     'orig_size1': orig_size,            # 🌟 新規追加必須
-        #     'T_rel':      torch.from_numpy(T_rel).float(),
-        #     'K':          torch.from_numpy(K_cropped).float(),
-        #     'valid':      torch.tensor(True),
-        #     # Rawデータも保持しておきたい場合は別キーで残す
-        #     'image0_raw': dict_t['raw'],
-        #     'image1_raw': dict_t1['raw'],
-        # }
         return {
             'image0':     dict_t['8bit'],   
             'image1':     dict_t1['8bit'],
-            'depth0':     torch.from_numpy(depth0_cropped).float(), # [1, H, W]
-            # 'depth1':     torch.from_numpy(depth1_cropped).float(), # [1, H, W]
+            'depth0':     torch.from_numpy(depth0_cropped).float(), # [H, W]
             'orig_size0': orig_size,        
             'orig_size1': orig_size,        
             'T_rel':      torch.from_numpy(T_rel).float(),
